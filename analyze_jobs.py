@@ -896,7 +896,8 @@ def fetch_workday_job_detail(
 
     title = string_value(info.get("title")) or string_value(posting.get("title")) or public_url
     company = extract_organization_name(data.get("hiringOrganization"))
-    text = render_workday_job_text(info, company)
+    location = extract_workday_locations(info)
+    text = render_workday_job_text(info, company, location)
     job_req_id = string_value(info.get("jobReqId")) or string_value(
         posting.get("bulletFields", [""])[0]
         if isinstance(posting.get("bulletFields"), list) and posting.get("bulletFields")
@@ -913,7 +914,7 @@ def fetch_workday_job_detail(
         source_url=source.original_url,
         job_id=job_id,
         company=company,
-        location=string_value(info.get("location")),
+        location=location,
         job_req_id=job_req_id,
         posted_on=string_value(info.get("postedOn")),
         start_date=string_value(info.get("startDate")),
@@ -926,12 +927,16 @@ def fetch_workday_job_detail(
     )
 
 
-def render_workday_job_text(info: dict[str, Any], company: str) -> str:
+def render_workday_job_text(
+    info: dict[str, Any],
+    company: str,
+    location: str = "",
+) -> str:
     lines = []
     fields = [
         ("Title", info.get("title")),
         ("Company", company),
-        ("Location", info.get("location")),
+        ("Location", location or extract_workday_locations(info)),
         ("Remote type", info.get("remoteType")),
         ("Time type", info.get("timeType")),
         ("Posted", info.get("postedOn")),
@@ -949,6 +954,49 @@ def render_workday_job_text(info: dict[str, Any], company: str) -> str:
         lines.append(description)
 
     return normalize_extracted_text("\n".join(lines))
+
+
+def extract_workday_locations(info: dict[str, Any]) -> str:
+    locations: list[str] = []
+
+    add_location(locations, info.get("location"))
+    add_location(locations, info.get("jobRequisitionLocation"))
+
+    additional_locations = info.get("additionalLocations")
+    if isinstance(additional_locations, list):
+        for location in additional_locations:
+            add_location(locations, location)
+    else:
+        add_location(locations, additional_locations)
+
+    return "; ".join(dedupe_preserving_order(locations))
+
+
+def add_location(locations: list[str], value: Any) -> None:
+    if value is None:
+        return
+
+    if isinstance(value, dict):
+        text = string_value(value.get("descriptor") or value.get("name"))
+    else:
+        text = string_value(value)
+
+    if text:
+        locations.append(text)
+
+
+def dedupe_preserving_order(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        normalized = collapse_whitespace(value).lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(collapse_whitespace(value))
+
+    return deduped
 
 
 def default_headers(accept: str = "text/html") -> dict[str, str]:

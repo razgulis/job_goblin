@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ const (
 
 var screenNames = []string{"Dashboard", "Jobs", "Report", "Run"}
 var spinnerFrames = []string{"|", "/", "-", "\\"}
+var jobReferencePattern = regexp.MustCompile(`(?i)JR-\d+`)
 
 var (
 	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
@@ -42,7 +44,7 @@ var (
 	dividerStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	sectionStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	tableHeadStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229")).Background(lipgloss.Color("238"))
-	selectedRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	selectedRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("252"))
 	dimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	mutedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	successStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
@@ -93,17 +95,18 @@ type envSummary struct {
 }
 
 type jobRow struct {
-	id       string
-	title    string
-	company  string
-	location string
-	status   string
-	score    int
-	apply    string
-	url      string
-	lastSeen string
-	closedAt string
-	canApply string
+	id        string
+	title     string
+	company   string
+	location  string
+	status    string
+	score     int
+	apply     string
+	reference string
+	url       string
+	lastSeen  string
+	closedAt  string
+	canApply  string
 }
 
 type stateSummary struct {
@@ -508,15 +511,18 @@ func (m model) jobsView() string {
 	m.scroll = start
 
 	titleW, companyW, locationW := jobColumnWidths(m.width)
+	refW := 11
+	statusW := 12
+	widths := []int{5, statusW, 6, refW, titleW, companyW, locationW}
 	lines := []string{
 		sectionStyle.Render(fmt.Sprintf("Jobs (%d tracked)", len(m.jobs))),
 		renderTableRow(
-			[]int{2, 5, 11, 6, titleW, companyW, locationW},
+			widths,
 			[]tableCell{
-				{text: ""},
 				{text: "Fit", style: tableHeadStyle, right: true},
 				{text: "Status", style: tableHeadStyle},
 				{text: "Apply", style: tableHeadStyle},
+				{text: "Ref", style: tableHeadStyle},
 				{text: "Title", style: tableHeadStyle},
 				{text: "Company", style: tableHeadStyle},
 				{text: "Location", style: tableHeadStyle},
@@ -529,37 +535,38 @@ func (m model) jobsView() string {
 	end := min(len(m.jobs), start+height-len(lines))
 	for i := start; i < end; i++ {
 		job := m.jobs[i]
-		prefix := " "
-		if i == m.selectedJob {
-			prefix = ">"
-		}
 		score := "-"
 		if job.score >= 0 {
 			score = strconv.Itoa(job.score)
 		}
-		rowStyle := lipgloss.NewStyle()
-		if i == m.selectedJob {
-			rowStyle = selectedRowStyle
+		cells := []tableCell{
+			{text: score, style: scoreStyle(job.score), right: true},
+			{text: job.status, style: jobStatusStyle(job.status)},
+			{text: applyText(job), style: applyStyle(job.apply)},
+			{text: jobReference(job), style: mutedStyle},
+			{text: job.title},
+			{text: job.company, style: mutedStyle},
+			{text: styledLocation(job.location)},
 		}
-		line := renderTableRow(
-			[]int{2, 5, 11, 6, titleW, companyW, locationW},
-			[]tableCell{
-				{text: prefix, style: dimStyle},
-				{text: score, style: scoreStyle(job.score), right: true},
-				{text: job.status, style: jobStatusStyle(job.status)},
-				{text: applyText(job), style: applyStyle(job.apply)},
-				{text: job.title},
-				{text: job.company, style: mutedStyle},
-				{text: job.location, style: locationStyle(job.location)},
-			},
-			rowStyle,
-		)
+		if i == m.selectedJob {
+			cells = highlightCells(cells)
+		}
+		line := renderTableRow(widths, cells, lipgloss.NewStyle())
+		if i == m.selectedJob {
+			line = selectedRowStyle.Render(padStyledLine(line, m.width))
+		}
 		lines = append(lines, truncateStyled(line, m.width))
 	}
 
 	if m.selectedJob >= 0 && m.selectedJob < len(m.jobs) {
 		job := m.jobs[m.selectedJob]
-		lines = append(lines, "", keyValue("Selected URL", shortenURL(job.url)))
+		lines = append(
+			lines,
+			"",
+			keyValue("Selected ref", jobReference(job)),
+			keyValue("Selected locations", valueOrDash(job.location)),
+			keyValue("Selected URL", shortenURL(job.url)),
+		)
 	}
 
 	return fitLines(lines, height, m.width)
@@ -766,20 +773,11 @@ func loadEnvSummary(appDir string) (envSummary, error) {
 		return envSummary{}, err
 	}
 
-	urlCount := 0
-	for _, item := range strings.FieldsFunc(values["JOB_URLS"], func(r rune) bool {
-		return r == '\n' || r == ','
-	}) {
-		if strings.TrimSpace(item) != "" {
-			urlCount++
-		}
-	}
-
 	return envSummary{
 		resumeFile:              values["RESUME_FILE"],
 		model:                   values["LLM_MODEL"],
 		baseURL:                 values["LLM_BASE_URL"],
-		jobURLCount:             urlCount,
+		jobURLCount:             countJobURLs(values["JOB_URLS"]),
 		maxJobsPerSource:        values["MAX_JOBS_PER_SOURCE"],
 		workdayPageSize:         values["WORKDAY_PAGE_SIZE"],
 		maxNewEvaluationsPerRun: values["MAX_NEW_EVALUATIONS_PER_RUN"],
@@ -806,7 +804,7 @@ func readDotEnv(path string) (map[string]string, error) {
 		}
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
-		if strings.HasPrefix(value, "\"") && !strings.HasSuffix(value, "\"") {
+		if isMultilineQuotedValue(value) {
 			var collected []string
 			collected = append(collected, strings.TrimPrefix(value, "\""))
 			for i+1 < len(lines) {
@@ -825,6 +823,24 @@ func readDotEnv(path string) (map[string]string, error) {
 		values[key] = strings.TrimSpace(value)
 	}
 	return values, nil
+}
+
+func isMultilineQuotedValue(value string) bool {
+	return strings.HasPrefix(value, "\"") && (len(value) == 1 || !strings.HasSuffix(value[1:], "\""))
+}
+
+func countJobURLs(raw string) int {
+	count := 0
+	for _, item := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == ','
+	}) {
+		value := strings.TrimSpace(strings.Trim(item, "\"'"))
+		if value == "" || strings.HasPrefix(value, "#") {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func loadJobs(appDir string) ([]jobRow, stateSummary, error) {
@@ -856,17 +872,18 @@ func loadJobs(appDir string) ([]jobRow, stateSummary, error) {
 	var summary stateSummary
 	for _, record := range records[1:] {
 		row := jobRow{
-			id:       csvValue(record, header, "job_id"),
-			title:    csvValue(record, header, "title"),
-			company:  csvValue(record, header, "company"),
-			location: csvValue(record, header, "location"),
-			status:   csvValue(record, header, "last_evaluation_status"),
-			score:    parseScore(csvValue(record, header, "fit_score")),
-			apply:    csvValue(record, header, "should_apply"),
-			url:      csvValue(record, header, "job_url"),
-			lastSeen: csvValue(record, header, "last_seen_at"),
-			closedAt: csvValue(record, header, "closed_at"),
-			canApply: csvValue(record, header, "can_apply"),
+			id:        csvValue(record, header, "job_id"),
+			title:     csvValue(record, header, "title"),
+			company:   csvValue(record, header, "company"),
+			location:  csvValue(record, header, "location"),
+			status:    csvValue(record, header, "last_evaluation_status"),
+			score:     parseScore(csvValue(record, header, "fit_score")),
+			apply:     csvValue(record, header, "should_apply"),
+			reference: csvValue(record, header, "job_req_id"),
+			url:       csvValue(record, header, "job_url"),
+			lastSeen:  csvValue(record, header, "last_seen_at"),
+			closedAt:  csvValue(record, header, "closed_at"),
+			canApply:  csvValue(record, header, "can_apply"),
 		}
 		rows = append(rows, row)
 		summary.total++
@@ -992,14 +1009,14 @@ func boolText(value bool) string {
 }
 
 func jobColumnWidths(width int) (int, int, int) {
-	remaining := max(24, width-30)
-	title := remaining / 2
-	company := remaining / 4
+	remaining := max(36, width-40)
+	title := remaining * 3 / 10
+	company := remaining / 5
 	location := remaining - title - company
 
 	title = max(14, title)
 	company = max(12, company)
-	location = max(10, location)
+	location = max(18, location)
 
 	for title+company+location > remaining {
 		switch {
@@ -1007,7 +1024,7 @@ func jobColumnWidths(width int) (int, int, int) {
 			title--
 		case company > location && company > 12:
 			company--
-		case location > 10:
+		case location > 18:
 			location--
 		default:
 			title--
@@ -1015,6 +1032,18 @@ func jobColumnWidths(width int) (int, int, int) {
 	}
 
 	return title, company, location
+}
+
+func jobReference(job jobRow) string {
+	reference := strings.TrimSpace(job.reference)
+	if reference != "" {
+		return strings.ToUpper(reference)
+	}
+	match := jobReferencePattern.FindString(job.url)
+	if match == "" {
+		return "-"
+	}
+	return strings.ToUpper(match)
 }
 
 func renderTableRow(widths []int, cells []tableCell, rowStyle lipgloss.Style) string {
@@ -1028,6 +1057,23 @@ func renderTableRow(widths []int, cells []tableCell, rowStyle lipgloss.Style) st
 		parts = append(parts, cell.style.Render(text))
 	}
 	return rowStyle.Render(strings.Join(parts, " "))
+}
+
+func highlightCells(cells []tableCell) []tableCell {
+	highlighted := make([]tableCell, len(cells))
+	copy(highlighted, cells)
+	for index := range highlighted {
+		highlighted[index].style = highlighted[index].style.Background(lipgloss.Color("252"))
+	}
+	return highlighted
+}
+
+func padStyledLine(value string, width int) string {
+	padding := max(0, width-ansi.StringWidth(value))
+	if padding == 0 {
+		return value
+	}
+	return value + strings.Repeat(" ", padding)
 }
 
 func padCell(value string, width int, right bool) string {
@@ -1080,17 +1126,28 @@ func applyStyle(value string) lipgloss.Style {
 	}
 }
 
-func locationStyle(location string) lipgloss.Style {
+func styledLocation(location string) string {
 	if strings.TrimSpace(location) == "" {
-		return dimStyle
+		return dimStyle.Render("-")
 	}
-	if isUSLocation(location) {
-		return lipgloss.NewStyle()
+
+	parts := strings.Split(location, ";")
+	rendered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		text := strings.TrimSpace(part)
+		if text == "" {
+			continue
+		}
+		if isUSLocationPart(text) {
+			rendered = append(rendered, text)
+		} else {
+			rendered = append(rendered, warnStyle.Render(text))
+		}
 	}
-	return warnStyle
+	return strings.Join(rendered, "; ")
 }
 
-func isUSLocation(location string) bool {
+func isUSLocationPart(location string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(location))
 	return strings.HasPrefix(normalized, "usa") || strings.HasPrefix(normalized, "us ")
 }
