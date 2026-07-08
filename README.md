@@ -75,10 +75,14 @@ Useful keys:
 ```text
 r       run the full analyzer
 d       run the analyzer in dry-run mode
-R       refresh local state, report, and config
+R       refresh local state and config
 tab     switch views
-1-4     jump to Dashboard, Jobs, Report, or Run
+1-4     jump to Dashboard, Jobs, Archived, or Run
 arrows  scroll or move through jobs
+enter   show the selected job report from Jobs or Archived
+esc     close the selected job report
+a       archive the selected active job from Jobs
+u       unarchive the selected job from Archived
 c       cancel an active run
 q       quit
 ```
@@ -137,6 +141,6 @@ job_goblin/state/jobs.csv
 job_goblin/state/analyses/
 ```
 
-The CSV tracks job IDs, URLs, titles, company, location, content hash, first/last seen timestamps, applyability, fit score, and evaluation metadata. Full LLM analysis payloads are stored as JSON sidecars under `state/analyses/`.
+The CSV tracks job IDs, URLs, titles, company, location, content hash, first/last seen timestamps, applyability, archive status, fit score, and evaluation metadata. Full LLM analysis payloads are stored as JSON sidecars under `state/analyses/`.
 
-On later runs, unchanged jobs with cached analysis are reused instead of sent to the LLM again. Jobs where `can_apply` is false are marked closed and excluded from the report.
+On later runs, unchanged active jobs with cached analysis are reused instead of sent to the LLM again. Manually archived, expired, closed, and non-applyable jobs are excluded from active scraping and evaluation and are visible in the Archived tab.

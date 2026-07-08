@@ -9,7 +9,7 @@ import hashlib
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -53,6 +53,8 @@ STATE_FIELDS = [
     "first_seen_at",
     "last_seen_at",
     "closed_at",
+    "archived_at",
+    "archive_reason",
     "can_apply",
     "fit_score",
     "should_apply",
@@ -125,6 +127,12 @@ class RunStats:
     truncated_sources: int = 0
 
 
+@dataclass(frozen=True)
+class ArchiveIndex:
+    job_ids: set[str]
+    job_urls: set[str]
+
+
 class ConfigError(Exception):
     pass
 
@@ -174,15 +182,31 @@ def main(argv: list[str] | None = None) -> int:
             timeout=config.llm_timeout_seconds,
         )
 
-    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    now_dt = datetime.now().astimezone()
+    now = now_dt.isoformat(timespec="seconds")
     state = load_job_state()
     updated_state = {job_id: dict(row) for job_id, row in state.items()}
+    auto_archived = archive_inactive_state_rows(updated_state, now, now_dt)
+    archive_index = build_archive_index(updated_state)
     results: list[JobRunResult] = []
     stats = RunStats()
     notes: list[str] = []
     seen_job_urls: set[str] = set()
     seen_job_ids: set[str] = set()
     total_sources = len(config.job_urls)
+
+    if auto_archived:
+        event_type = "jobs_would_auto_archive" if args.dry_run else "jobs_auto_archived"
+        message = (
+            f"Would archive {auto_archived} expired, closed, or non-applyable jobs."
+            if args.dry_run
+            else f"Archived {auto_archived} expired, closed, or non-applyable jobs."
+        )
+        events.log(
+            event_type,
+            message,
+            count=auto_archived,
+        )
 
     for source_index, source_url in enumerate(config.job_urls, start=1):
         events.log(
@@ -193,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             url=source_url,
         )
         try:
-            source_result = scrape_source(source_url, config, events)
+            source_result = scrape_source(source_url, config, events, archive_index)
         except Exception as exc:
             stats.errors += 1
             results.append(
@@ -245,6 +269,22 @@ def main(argv: list[str] | None = None) -> int:
             stats.discovered += 1
 
             job_id = scraped.job_id or stable_hash(scraped.url)
+            if job_id in archive_index.job_ids:
+                events.log(
+                    "job_archived_skipped",
+                    f"[source {source_index}/{total_sources} job {job_index}/{total_jobs}] "
+                    f"Skipping archived job: {scraped.title}",
+                    source_index=source_index,
+                    total_sources=total_sources,
+                    job_index=job_index,
+                    total_jobs=total_jobs,
+                    job_id=job_id,
+                    title=scraped.title,
+                    company=scraped.company,
+                    url=scraped.url,
+                )
+                continue
+
             seen_job_ids.add(job_id)
             content_hash = hash_job_content(scraped)
             prior = state.get(job_id, {})
@@ -279,12 +319,38 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
 
+            if is_expired(scraped.expires_at, now_dt):
+                record["closed_at"] = record.get("closed_at") or now
+                record["last_evaluation_status"] = "closed"
+                mark_archived(record, now, "expired")
+                updated_state[job_id] = record
+                archive_index.job_ids.add(job_id)
+                archive_index.job_urls.add(scraped.url)
+                events.log(
+                    "job_expired",
+                    f"[source {source_index}/{total_sources} job {job_index}/{total_jobs}] "
+                    f"Archiving expired job: {scraped.title}",
+                    source_index=source_index,
+                    total_sources=total_sources,
+                    job_index=job_index,
+                    total_jobs=total_jobs,
+                    job_id=job_id,
+                    title=scraped.title,
+                    company=scraped.company,
+                    url=scraped.url,
+                    expires_at=scraped.expires_at,
+                )
+                continue
+
             if not scraped.can_apply:
                 stats.skipped_closed += 1
                 record["can_apply"] = "false"
                 record["closed_at"] = record.get("closed_at") or now
                 record["last_evaluation_status"] = "closed"
+                mark_archived(record, now, "closed")
                 updated_state[job_id] = record
+                archive_index.job_ids.add(job_id)
+                archive_index.job_urls.add(scraped.url)
                 events.log(
                     "job_closed",
                     f"[source {source_index}/{total_sources} job {job_index}/{total_jobs}] "
@@ -691,10 +757,26 @@ def scrape_source(
     source_url: str,
     config: Config,
     events: EventSink | None = None,
+    archive_index: ArchiveIndex | None = None,
 ) -> SourceScrapeResult:
+    archive_index = archive_index or ArchiveIndex(job_ids=set(), job_urls=set())
     workday_source = parse_workday_search_source(source_url)
     if workday_source:
-        return scrape_workday_search(workday_source, config, events or EventSink())
+        return scrape_workday_search(
+            workday_source,
+            config,
+            events or EventSink(),
+            archive_index,
+        )
+
+    if source_url in archive_index.job_urls:
+        if events:
+            events.log(
+                "source_archived_skipped",
+                f"Skipping archived direct job source: {source_url}",
+                url=source_url,
+            )
+        return SourceScrapeResult(source_url=source_url, jobs=[], total_available=0)
 
     job = scrape_job(source_url, config.scrape_timeout_seconds)
     return SourceScrapeResult(source_url=source_url, jobs=[job], total_available=1)
@@ -776,6 +858,7 @@ def scrape_workday_search(
     source: WorkdaySearchSource,
     config: Config,
     events: EventSink,
+    archive_index: ArchiveIndex,
 ) -> SourceScrapeResult:
     session = requests.Session()
     postings, total_available = list_workday_postings(session, source, config)
@@ -795,6 +878,19 @@ def scrape_workday_search(
     for index, posting in enumerate(postings, start=1):
         title = string_value(posting.get("title")) or "Unknown Workday posting"
         external_path = string_value(posting.get("externalPath"))
+        posting_job_id = workday_posting_job_id(source, posting)
+        if posting_job_id in archive_index.job_ids:
+            events.log(
+                "job_archived_skipped",
+                f"[Workday detail {index}/{total}] Skipping archived job: {title}",
+                index=index,
+                total=total,
+                job_id=posting_job_id,
+                title=title,
+                url=source.original_url,
+            )
+            continue
+
         if not external_path:
             jobs.append(
                 ScrapedJob(
@@ -868,6 +964,18 @@ def list_workday_postings(
     if not total_available:
         total_available = len(postings)
     return postings, total_available
+
+
+def workday_posting_job_id(source: WorkdaySearchSource, posting: dict[str, Any]) -> str:
+    external_path = string_value(posting.get("externalPath"))
+    job_req_id = string_value(
+        posting.get("bulletFields", [""])[0]
+        if isinstance(posting.get("bulletFields"), list) and posting.get("bulletFields")
+        else ""
+    )
+    title = string_value(posting.get("title"))
+    fallback = external_path or title
+    return f"workday:{source.tenant}:{source.site}:{job_req_id or stable_hash(fallback)}"
 
 
 def fetch_workday_job_detail(
@@ -1427,6 +1535,91 @@ def load_job_state() -> dict[str, dict[str, str]]:
 
 def normalize_state_row(row: dict[str, Any]) -> dict[str, str]:
     return {field: string_value(row.get(field)) for field in STATE_FIELDS}
+
+
+def build_archive_index(rows: dict[str, dict[str, str]]) -> ArchiveIndex:
+    job_ids: set[str] = set()
+    job_urls: set[str] = set()
+    for job_id, row in rows.items():
+        if not is_archived(row):
+            continue
+        job_ids.add(job_id)
+        job_url = row.get("job_url", "").strip()
+        if job_url:
+            job_urls.add(job_url)
+    return ArchiveIndex(job_ids=job_ids, job_urls=job_urls)
+
+
+def archive_inactive_state_rows(
+    rows: dict[str, dict[str, str]],
+    archived_at: str,
+    now: datetime,
+) -> int:
+    archived = 0
+    for row in rows.values():
+        if is_archived(row):
+            continue
+
+        reason = inactive_archive_reason(row, now)
+        if not reason:
+            continue
+
+        if not row.get("closed_at"):
+            row["closed_at"] = archived_at
+        mark_archived(row, archived_at, reason)
+        archived += 1
+
+    return archived
+
+
+def inactive_archive_reason(row: dict[str, str], now: datetime) -> str:
+    if is_expired(row.get("expires_at", ""), now):
+        return "expired"
+
+    if row.get("closed_at"):
+        return "closed"
+
+    if row.get("last_evaluation_status", "").lower() == "closed":
+        return "closed"
+
+    if row.get("can_apply", "").lower() == "false":
+        return "closed"
+
+    return ""
+
+
+def is_archived(row: dict[str, str]) -> bool:
+    return bool(row.get("archived_at") or row.get("archive_reason"))
+
+
+def mark_archived(row: dict[str, str], archived_at: str, reason: str) -> None:
+    row["archived_at"] = row.get("archived_at") or archived_at
+    row["archive_reason"] = row.get("archive_reason") or reason
+
+
+def is_expired(raw_expires_at: str, now: datetime) -> bool:
+    expires_at = parse_expiration_date(raw_expires_at)
+    return bool(expires_at and expires_at < now.date())
+
+
+def parse_expiration_date(raw_expires_at: str) -> date | None:
+    value = raw_expires_at.strip()
+    if not value:
+        return None
+
+    iso_value = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(iso_value).date()
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%b %d, %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+
+    return None
 
 
 def write_job_state(rows: dict[str, dict[str, str]]) -> None:

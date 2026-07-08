@@ -29,11 +29,11 @@ type screen int
 const (
 	screenDashboard screen = iota
 	screenJobs
-	screenReport
+	screenArchived
 	screenRun
 )
 
-var screenNames = []string{"Dashboard", "Jobs", "Report", "Run"}
+var screenNames = []string{"Dashboard", "Jobs", "Archived", "Run"}
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 var jobReferencePattern = regexp.MustCompile(`(?i)JR-\d+`)
 
@@ -63,19 +63,25 @@ type tableCell struct {
 }
 
 type model struct {
-	appDir      string
-	width       int
-	height      int
-	screen      screen
-	scroll      int
-	selectedJob int
+	appDir           string
+	width            int
+	height           int
+	screen           screen
+	scroll           int
+	selectedJob      int
+	selectedArchived int
+	detailOpen       bool
+	detailJobID      string
+	detailScroll     int
+	confirmArchive   bool
 
-	env     envSummary
-	jobs    []jobRow
-	state   stateSummary
-	report  []string
-	loaded  time.Time
-	loadErr string
+	env      envSummary
+	jobs     []jobRow
+	archived []jobRow
+	state    stateSummary
+	report   []string
+	loaded   time.Time
+	loadErr  string
 
 	run       *runState
 	runEvents chan tea.Msg
@@ -95,22 +101,30 @@ type envSummary struct {
 }
 
 type jobRow struct {
-	id        string
-	title     string
-	company   string
-	location  string
-	status    string
-	score     int
-	apply     string
-	reference string
-	url       string
-	lastSeen  string
-	closedAt  string
-	canApply  string
+	id            string
+	title         string
+	company       string
+	location      string
+	status        string
+	score         int
+	apply         string
+	reference     string
+	url           string
+	lastSeen      string
+	closedAt      string
+	expiresAt     string
+	archivedAt    string
+	archiveReason string
+	canApply      string
+	analysisPath  string
+	analysis      jobAnalysis
+	analysisErr   string
 }
 
 type stateSummary struct {
 	total     int
+	active    int
+	archived  int
 	scored    int
 	apply     int
 	deferred  int
@@ -118,6 +132,23 @@ type stateSummary struct {
 	evaluated int
 	errors    int
 	closed    int
+}
+
+type jobAnalysis struct {
+	JobTitle                string   `json:"job_title"`
+	Company                 string   `json:"company"`
+	FitScore                int      `json:"fit_score"`
+	ShouldApply             bool     `json:"should_apply"`
+	Summary                 string   `json:"summary"`
+	MatchedSkills           []string `json:"matched_skills"`
+	MissingSkills           []string `json:"missing_skills"`
+	ExperienceAlignment     string   `json:"experience_alignment"`
+	Concerns                []string `json:"concerns"`
+	RecommendedResumeTweaks []string `json:"recommended_resume_tweaks"`
+}
+
+type analysisFile struct {
+	Analysis jobAnalysis `json:"analysis"`
 }
 
 type runState struct {
@@ -132,12 +163,13 @@ type runState struct {
 }
 
 type refreshMsg struct {
-	env    envSummary
-	jobs   []jobRow
-	state  stateSummary
-	report []string
-	err    string
-	loaded time.Time
+	env      envSummary
+	jobs     []jobRow
+	archived []jobRow
+	state    stateSummary
+	report   []string
+	err      string
+	loaded   time.Time
 }
 
 type runStartedMsg struct {
@@ -151,6 +183,12 @@ type runEventMsg struct {
 
 type runDoneMsg struct {
 	err string
+}
+
+type archiveDoneMsg struct {
+	jobID    string
+	archived bool
+	err      string
 }
 
 type tickMsg time.Time
@@ -191,10 +229,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		m.env = msg.env
 		m.jobs = msg.jobs
+		m.archived = msg.archived
 		m.state = msg.state
 		m.report = msg.report
 		m.loaded = msg.loaded
 		m.loadErr = msg.err
+		m.selectedJob = clampSelection(m.selectedJob, len(m.jobs))
+		m.selectedArchived = clampSelection(m.selectedArchived, len(m.archived))
 		if m.status == "" || strings.HasPrefix(m.status, "Loaded") || m.status == "Ready" {
 			m.status = "Loaded local state"
 		}
@@ -232,6 +273,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, loadDataCmd(m.appDir)
 
+	case archiveDoneMsg:
+		m.confirmArchive = false
+		if msg.err != "" {
+			m.status = msg.err
+			return m, nil
+		}
+		if msg.archived {
+			m.status = "Archived job"
+		} else {
+			m.status = "Unarchived job"
+		}
+		m.detailOpen = false
+		m.detailJobID = ""
+		m.detailScroll = 0
+		return m, loadDataCmd(m.appDir)
+
 	case tickMsg:
 		if m.run != nil && m.run.running {
 			m.run.spinnerIndex = (m.run.spinnerIndex + 1) % len(spinnerFrames)
@@ -247,12 +304,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch key.String() {
+	keyName := key.String()
+	switch keyName {
 	case "ctrl+c", "q":
 		if m.cancelRun != nil {
 			m.cancelRun()
 		}
 		return m, tea.Quit
+	}
+
+	if m.confirmArchive {
+		return updateArchiveConfirmation(m, key)
+	}
+	if m.detailOpen {
+		return updateDetailKey(m, key)
+	}
+
+	switch keyName {
 	case "tab":
 		m.screen = screen((int(m.screen) + 1) % len(screenNames))
 		m.scroll = 0
@@ -270,7 +338,7 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scroll = 0
 		return m, nil
 	case "3":
-		m.screen = screenReport
+		m.screen = screenArchived
 		m.scroll = 0
 		return m, nil
 	case "4":
@@ -298,6 +366,35 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "Cancelling run"
 		}
 		return m, nil
+	case "enter":
+		if job, ok := m.selectedDetailJob(); ok {
+			m.detailOpen = true
+			m.detailJobID = job.id
+			m.detailScroll = 0
+			m.status = "Viewing job report"
+		}
+		return m, nil
+	case "a":
+		if m.screen == screenJobs {
+			if _, ok := m.selectedActiveJob(); !ok {
+				m.status = "No job selected"
+				return m, nil
+			}
+			m.confirmArchive = true
+			m.status = "Archive selected job? y confirm, n cancel"
+		}
+		return m, nil
+	case "u":
+		if m.screen == screenArchived {
+			job, ok := m.selectedArchivedJob()
+			if !ok {
+				m.status = "No archived job selected"
+				return m, nil
+			}
+			m.status = "Unarchiving job"
+			return m, setJobArchiveCmd(m.appDir, job.id, false, "")
+		}
+		return m, nil
 	case "up", "k":
 		m.moveUp()
 		return m, nil
@@ -313,16 +410,117 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "home", "g":
 		m.scroll = 0
 		m.selectedJob = 0
+		m.selectedArchived = 0
 		return m, nil
 	case "end", "G":
 		m.scroll = 1_000_000
 		if len(m.jobs) > 0 {
 			m.selectedJob = len(m.jobs) - 1
 		}
+		if len(m.archived) > 0 {
+			m.selectedArchived = len(m.archived) - 1
+		}
 		return m, nil
 	}
 
 	return m, nil
+}
+
+func updateArchiveConfirmation(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "y", "Y", "enter":
+		job, ok := m.selectedActiveJob()
+		if !ok {
+			m.confirmArchive = false
+			m.status = "No job selected"
+			return m, nil
+		}
+		m.status = "Archiving job"
+		return m, setJobArchiveCmd(m.appDir, job.id, true, "manual")
+	case "n", "N", "esc", "c":
+		m.confirmArchive = false
+		m.status = "Archive cancelled"
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func updateDetailKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "esc":
+		m.detailOpen = false
+		m.detailJobID = ""
+		m.detailScroll = 0
+		m.status = "Loaded local state"
+	case "up", "k":
+		if m.detailScroll > 0 {
+			m.detailScroll--
+		}
+	case "down", "j":
+		m.detailScroll++
+	case "pgup":
+		m.detailScroll = max(0, m.detailScroll-max(1, m.contentHeight()-4))
+	case "pgdown":
+		m.detailScroll += max(1, m.contentHeight()-4)
+	case "home", "g":
+		m.detailScroll = 0
+	case "end", "G":
+		m.detailScroll = 1_000_000
+	}
+	return m, nil
+}
+
+func (m model) selectedActiveJob() (jobRow, bool) {
+	if m.selectedJob < 0 || m.selectedJob >= len(m.jobs) {
+		return jobRow{}, false
+	}
+	return m.jobs[m.selectedJob], true
+}
+
+func (m model) selectedArchivedJob() (jobRow, bool) {
+	if m.selectedArchived < 0 || m.selectedArchived >= len(m.archived) {
+		return jobRow{}, false
+	}
+	return m.archived[m.selectedArchived], true
+}
+
+func (m model) selectedDetailJob() (jobRow, bool) {
+	switch m.screen {
+	case screenJobs:
+		return m.selectedActiveJob()
+	case screenArchived:
+		return m.selectedArchivedJob()
+	default:
+		return jobRow{}, false
+	}
+}
+
+func (m model) detailJob() (jobRow, bool) {
+	for _, job := range m.jobs {
+		if job.id == m.detailJobID {
+			return job, true
+		}
+	}
+	for _, job := range m.archived {
+		if job.id == m.detailJobID {
+			return job, true
+		}
+	}
+	return jobRow{}, false
+}
+
+func clampSelection(selected int, length int) int {
+	if length <= 0 {
+		return 0
+	}
+	if selected < 0 {
+		return 0
+	}
+	if selected >= length {
+		return length - 1
+	}
+	return selected
 }
 
 func startRun(m model, dryRun bool) (tea.Model, tea.Cmd) {
@@ -347,7 +545,11 @@ func (m *model) moveUp() {
 		if m.selectedJob > 0 {
 			m.selectedJob--
 		}
-	case screenReport, screenRun:
+	case screenArchived:
+		if m.selectedArchived > 0 {
+			m.selectedArchived--
+		}
+	case screenRun:
 		if m.scroll > 0 {
 			m.scroll--
 		}
@@ -360,7 +562,11 @@ func (m *model) moveDown() {
 		if m.selectedJob < len(m.jobs)-1 {
 			m.selectedJob++
 		}
-	case screenReport, screenRun:
+	case screenArchived:
+		if m.selectedArchived < len(m.archived)-1 {
+			m.selectedArchived++
+		}
+	case screenRun:
 		m.scroll++
 	}
 }
@@ -370,7 +576,9 @@ func (m *model) pageUp() {
 	switch m.screen {
 	case screenJobs:
 		m.selectedJob = max(0, m.selectedJob-step)
-	case screenReport, screenRun:
+	case screenArchived:
+		m.selectedArchived = max(0, m.selectedArchived-step)
+	case screenRun:
 		m.scroll = max(0, m.scroll-step)
 	}
 }
@@ -380,7 +588,9 @@ func (m *model) pageDown() {
 	switch m.screen {
 	case screenJobs:
 		m.selectedJob = min(max(0, len(m.jobs)-1), m.selectedJob+step)
-	case screenReport, screenRun:
+	case screenArchived:
+		m.selectedArchived = min(max(0, len(m.archived)-1), m.selectedArchived+step)
+	case screenRun:
 		m.scroll += step
 	}
 }
@@ -396,8 +606,8 @@ func (m model) View() string {
 		body = m.dashboardView()
 	case screenJobs:
 		body = m.jobsView()
-	case screenReport:
-		body = m.reportView()
+	case screenArchived:
+		body = m.archivedView()
 	case screenRun:
 		body = m.runView()
 	default:
@@ -442,6 +652,18 @@ func (m model) footerView() string {
 	if m.run == nil || !m.run.running {
 		help = "r run  d dry-run  R refresh  tab switch  arrows scroll  q quit"
 	}
+	if m.confirmArchive {
+		help = "y archive  n/esc cancel  q quit"
+	} else if m.detailOpen {
+		help = "esc close  arrows scroll  q quit"
+	} else {
+		switch m.screen {
+		case screenJobs:
+			help = "enter details  a archive  arrows move  r run  R refresh  q quit"
+		case screenArchived:
+			help = "enter details  u unarchive  arrows move  r run  R refresh  q quit"
+		}
+	}
 	status := m.status
 	if m.loadErr != "" {
 		status = m.loadErr
@@ -468,6 +690,8 @@ func (m model) dashboardView() string {
 		"",
 		sectionStyle.Render("State"),
 		keyValue("Jobs tracked", strconv.Itoa(m.state.total)),
+		keyValue("Active jobs", strconv.Itoa(m.state.active)),
+		keyValue("Archived jobs", mutedStyle.Render(strconv.Itoa(m.state.archived))),
 		keyValue("Scored jobs", strconv.Itoa(m.state.scored)),
 		keyValue("Recommended apply", successStyle.Render(strconv.Itoa(m.state.apply))),
 		keyValue("Deferred", warnStyle.Render(strconv.Itoa(m.state.deferred))),
@@ -477,7 +701,7 @@ func (m model) dashboardView() string {
 		keyValue("Closed/non-applyable", mutedStyle.Render(strconv.Itoa(m.state.closed))),
 		"",
 		sectionStyle.Render("Files"),
-		keyValue("Report lines", strconv.Itoa(len(m.report))),
+		keyValue("Report file lines", strconv.Itoa(len(m.report))),
 		keyValue("Loaded", formatTime(m.loaded)),
 	}
 
@@ -489,8 +713,11 @@ func (m model) dashboardView() string {
 }
 
 func (m model) jobsView() string {
+	if m.detailOpen {
+		return m.jobDetailView()
+	}
 	if len(m.jobs) == 0 {
-		return fitLines([]string{"No jobs are tracked yet."}, m.contentHeight(), m.width)
+		return fitLines([]string{"No active jobs are tracked."}, m.contentHeight(), m.width)
 	}
 
 	height := m.contentHeight()
@@ -515,7 +742,7 @@ func (m model) jobsView() string {
 	statusW := 12
 	widths := []int{5, statusW, 6, refW, titleW, companyW, locationW}
 	lines := []string{
-		sectionStyle.Render(fmt.Sprintf("Jobs (%d tracked)", len(m.jobs))),
+		sectionStyle.Render(fmt.Sprintf("Jobs (%d active)", len(m.jobs))),
 		renderTableRow(
 			widths,
 			[]tableCell{
@@ -563,13 +790,312 @@ func (m model) jobsView() string {
 		lines = append(
 			lines,
 			"",
+			keyValue("Action", "enter details, a archive"),
 			keyValue("Selected ref", jobReference(job)),
 			keyValue("Selected locations", valueOrDash(job.location)),
+			keyValue("Selected URL", shortenURL(job.url)),
+		)
+		if m.confirmArchive {
+			lines = append(lines, warnStyle.Render("Confirm archive: y archives this job, n or esc cancels."))
+		}
+	}
+
+	return fitLines(lines, height, m.width)
+}
+
+func (m model) archivedView() string {
+	if m.detailOpen {
+		return m.jobDetailView()
+	}
+	if len(m.archived) == 0 {
+		return fitLines([]string{"No archived jobs are tracked."}, m.contentHeight(), m.width)
+	}
+
+	height := m.contentHeight()
+	if m.selectedArchived < 0 {
+		m.selectedArchived = 0
+	}
+	if m.selectedArchived >= len(m.archived) {
+		m.selectedArchived = len(m.archived) - 1
+	}
+
+	start := m.scroll
+	if m.selectedArchived < start {
+		start = m.selectedArchived
+	}
+	if m.selectedArchived >= start+height-3 {
+		start = max(0, m.selectedArchived-height+4)
+	}
+	m.scroll = start
+
+	titleW, companyW, locationW := archivedColumnWidths(m.width)
+	refW := 11
+	reasonW := 18
+	archivedW := 16
+	widths := []int{5, reasonW, archivedW, refW, titleW, companyW, locationW}
+	lines := []string{
+		sectionStyle.Render(fmt.Sprintf("Archived (%d jobs)", len(m.archived))),
+		renderTableRow(
+			widths,
+			[]tableCell{
+				{text: "Fit", style: tableHeadStyle, right: true},
+				{text: "Reason", style: tableHeadStyle},
+				{text: "Archived", style: tableHeadStyle},
+				{text: "Ref", style: tableHeadStyle},
+				{text: "Title", style: tableHeadStyle},
+				{text: "Company", style: tableHeadStyle},
+				{text: "Location", style: tableHeadStyle},
+			},
+			tableHeadStyle,
+		),
+		dividerStyle.Render(strings.Repeat("─", m.width)),
+	}
+
+	end := min(len(m.archived), start+height-len(lines))
+	for i := start; i < end; i++ {
+		job := m.archived[i]
+		score := "-"
+		if job.score >= 0 {
+			score = strconv.Itoa(job.score)
+		}
+		cells := []tableCell{
+			{text: score, style: scoreStyle(job.score), right: true},
+			{text: archiveReasonLabel(job.archiveReason), style: archiveReasonStyle(job.archiveReason)},
+			{text: shortTimestamp(job.archivedAt), style: mutedStyle},
+			{text: jobReference(job), style: mutedStyle},
+			{text: job.title},
+			{text: job.company, style: mutedStyle},
+			{text: styledLocation(job.location)},
+		}
+		if i == m.selectedArchived {
+			cells = highlightCells(cells)
+		}
+		line := renderTableRow(widths, cells, lipgloss.NewStyle())
+		if i == m.selectedArchived {
+			line = selectedRowStyle.Render(padStyledLine(line, m.width))
+		}
+		lines = append(lines, truncateStyled(line, m.width))
+	}
+
+	if m.selectedArchived >= 0 && m.selectedArchived < len(m.archived) {
+		job := m.archived[m.selectedArchived]
+		lines = append(
+			lines,
+			"",
+			keyValue("Action", "enter details, u unarchive"),
+			keyValue("Selected ref", jobReference(job)),
+			keyValue("Archive reason", archiveReasonLabel(job.archiveReason)),
 			keyValue("Selected URL", shortenURL(job.url)),
 		)
 	}
 
 	return fitLines(lines, height, m.width)
+}
+
+func (m model) jobDetailView() string {
+	job, ok := m.detailJob()
+	if !ok {
+		return fitLines([]string{"Selected job is no longer available."}, m.contentHeight(), m.width)
+	}
+
+	boxWidth := max(4, m.width)
+	innerWidth := max(1, boxWidth-4)
+	innerHeight := max(1, m.contentHeight()-2)
+	lines := renderJobDetailLines(job, innerWidth)
+	visible := strings.Split(scrollLines(lines, m.detailScroll, innerHeight, innerWidth), "\n")
+	title := "Job Report"
+	if rowArchived(job) {
+		title = "Archived Job Report"
+	}
+	return renderBox(title, visible, boxWidth)
+}
+
+func renderJobDetailLines(job jobRow, width int) []string {
+	analysis := job.analysis
+	hasAnalysis := jobHasAnalysis(job)
+	title := firstNonEmpty(analysis.JobTitle, job.title, job.url)
+	company := firstNonEmpty(analysis.Company, job.company, "Unknown")
+	score := job.score
+	if score < 0 && hasAnalysis {
+		score = analysis.FitScore
+	}
+	scoreText := "-"
+	if score >= 0 {
+		scoreText = fmt.Sprintf("%d/100", score)
+	}
+	recommendation := applyText(job)
+	if hasAnalysis {
+		if analysis.ShouldApply {
+			recommendation = "apply"
+		} else {
+			recommendation = "skip"
+		}
+	}
+
+	lines := []string{
+		sectionStyle.Render(title),
+		mutedStyle.Render(company),
+		"",
+	}
+	lines = append(lines, detailField("Status", valueOrDash(job.status), width)...)
+	lines = append(lines, detailField("Fit score", scoreText, width)...)
+	lines = append(lines, detailField("Recommendation", recommendation, width)...)
+	lines = append(lines, detailField("Reference", jobReference(job), width)...)
+	lines = append(lines, detailField("Location", valueOrDash(job.location), width)...)
+	lines = append(lines, detailField("URL", shortenURL(job.url), width)...)
+	if rowArchived(job) {
+		lines = append(lines, detailField("Archive reason", archiveReasonLabel(job.archiveReason), width)...)
+		lines = append(lines, detailField("Archived", shortTimestamp(job.archivedAt), width)...)
+	}
+
+	if job.analysisErr != "" {
+		lines = append(lines, "", warnStyle.Render("Analysis"), warnStyle.Render(job.analysisErr))
+	}
+	if !hasAnalysis {
+		lines = append(lines, "", mutedStyle.Render("No analysis is available for this job yet."))
+		return lines
+	}
+
+	lines = append(lines, detailSection("Summary", width)...)
+	lines = append(lines, wrapText(valueOrDash(analysis.Summary), width)...)
+	lines = append(lines, detailListSection("Why this fits", analysis.MatchedSkills, width)...)
+	lines = append(lines, detailListSection("Gaps", analysis.MissingSkills, width)...)
+	lines = append(lines, detailSection("Experience alignment", width)...)
+	lines = append(lines, wrapText(valueOrDash(analysis.ExperienceAlignment), width)...)
+	lines = append(lines, detailListSection("Concerns", analysis.Concerns, width)...)
+	lines = append(lines, detailListSection("Resume Tweaks", analysis.RecommendedResumeTweaks, width)...)
+	return lines
+}
+
+func detailField(label string, value string, width int) []string {
+	labelWidth := min(18, max(10, width/3))
+	valueWidth := max(8, width-labelWidth)
+	prefix := mutedStyle.Render(padCell(label+":", labelWidth, false))
+	wrapped := wrapText(valueOrDash(value), valueWidth)
+	if len(wrapped) == 0 {
+		return []string{prefix}
+	}
+	lines := []string{prefix + wrapped[0]}
+	for _, line := range wrapped[1:] {
+		lines = append(lines, strings.Repeat(" ", labelWidth)+line)
+	}
+	return lines
+}
+
+func detailSection(title string, width int) []string {
+	return []string{"", infoStyle.Render(truncatePlain(title, width))}
+}
+
+func detailListSection(title string, items []string, width int) []string {
+	lines := detailSection(title, width)
+	if len(items) == 0 {
+		return append(lines, dimStyle.Render("-")+" None noted.")
+	}
+	for _, item := range items {
+		lines = append(lines, wrapBullet(item, width)...)
+	}
+	return lines
+}
+
+func renderBox(title string, lines []string, width int) string {
+	innerWidth := max(1, width-4)
+	title = " " + title + " "
+	topRuleWidth := max(0, width-2-ansi.StringWidth(title))
+	top := "┌" + title + strings.Repeat("─", topRuleWidth) + "┐"
+	bottom := "└" + strings.Repeat("─", max(0, width-2)) + "┘"
+
+	rendered := []string{truncateStyled(top, width)}
+	for _, line := range lines {
+		line = truncateStyled(line, innerWidth)
+		rendered = append(rendered, "│ "+padStyledLine(line, innerWidth)+" │")
+	}
+	rendered = append(rendered, truncateStyled(bottom, width))
+	return strings.Join(rendered, "\n")
+}
+
+func jobHasAnalysis(job jobRow) bool {
+	return job.analysisPath != "" && job.analysisErr == ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func wrapText(value string, width int) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return []string{""}
+	}
+	width = max(1, width)
+	words := strings.Fields(value)
+	if len(words) == 0 {
+		return []string{""}
+	}
+
+	lines := []string{}
+	current := ""
+	for _, word := range words {
+		if ansi.StringWidth(word) > width {
+			if current != "" {
+				lines = append(lines, current)
+				current = ""
+			}
+			lines = append(lines, splitLongWord(word, width)...)
+			continue
+		}
+		if current == "" {
+			current = word
+			continue
+		}
+		candidate := current + " " + word
+		if ansi.StringWidth(candidate) <= width {
+			current = candidate
+			continue
+		}
+		lines = append(lines, current)
+		current = word
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+	return lines
+}
+
+func wrapBullet(value string, width int) []string {
+	bulletWidth := 2
+	wrapped := wrapText(value, max(1, width-bulletWidth))
+	if len(wrapped) == 0 {
+		return []string{dimStyle.Render("-")}
+	}
+	lines := []string{dimStyle.Render("-") + " " + wrapped[0]}
+	for _, line := range wrapped[1:] {
+		lines = append(lines, strings.Repeat(" ", bulletWidth)+line)
+	}
+	return lines
+}
+
+func splitLongWord(value string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	var lines []string
+	for ansi.StringWidth(value) > width {
+		piece := ansi.Truncate(value, width, "")
+		if piece == "" {
+			break
+		}
+		lines = append(lines, piece)
+		value = strings.TrimPrefix(value, piece)
+	}
+	if value != "" {
+		lines = append(lines, value)
+	}
+	return lines
 }
 
 func (m model) reportView() string {
@@ -627,7 +1153,7 @@ func (m model) contentHeight() int {
 func loadDataCmd(appDir string) tea.Cmd {
 	return func() tea.Msg {
 		env, envErr := loadEnvSummary(appDir)
-		jobs, state, stateErr := loadJobs(appDir)
+		jobs, archived, state, stateErr := loadJobs(appDir)
 		report, reportErr := loadReport(appDir)
 
 		var errs []string
@@ -638,12 +1164,13 @@ func loadDataCmd(appDir string) tea.Cmd {
 		}
 
 		return refreshMsg{
-			env:    env,
-			jobs:   jobs,
-			state:  state,
-			report: report,
-			err:    strings.Join(errs, "; "),
-			loaded: time.Now(),
+			env:      env,
+			jobs:     jobs,
+			archived: archived,
+			state:    state,
+			report:   report,
+			err:      strings.Join(errs, "; "),
+			loaded:   time.Now(),
 		}
 	}
 }
@@ -669,6 +1196,122 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+func setJobArchiveCmd(appDir string, jobID string, archived bool, reason string) tea.Cmd {
+	return func() tea.Msg {
+		err := setJobArchiveState(appDir, jobID, archived, reason, time.Now())
+		msg := archiveDoneMsg{jobID: jobID, archived: archived}
+		if err != nil {
+			msg.err = err.Error()
+		}
+		return msg
+	}
+}
+
+func setJobArchiveState(appDir string, jobID string, archived bool, reason string, now time.Time) error {
+	path := filepath.Join(appDir, "state", "jobs.csv")
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("could not read jobs.csv: %w", err)
+	}
+	records, err := csv.NewReader(file).ReadAll()
+	closeErr := file.Close()
+	if err != nil {
+		return fmt.Errorf("could not parse jobs.csv: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("could not close jobs.csv: %w", closeErr)
+	}
+	if len(records) == 0 {
+		return fmt.Errorf("jobs.csv is empty")
+	}
+
+	headers := append([]string{}, records[0]...)
+	headers = ensureCSVField(headers, "archived_at")
+	headers = ensureCSVField(headers, "archive_reason")
+	header := csvHeader(headers)
+	jobIDIndex, ok := header["job_id"]
+	if !ok {
+		return fmt.Errorf("jobs.csv does not contain job_id")
+	}
+	archivedAtIndex := header["archived_at"]
+	archiveReasonIndex := header["archive_reason"]
+
+	updated := false
+	for rowIndex := 1; rowIndex < len(records); rowIndex++ {
+		for len(records[rowIndex]) < len(headers) {
+			records[rowIndex] = append(records[rowIndex], "")
+		}
+		if jobIDIndex >= len(records[rowIndex]) || records[rowIndex][jobIDIndex] != jobID {
+			continue
+		}
+		if archived {
+			records[rowIndex][archivedAtIndex] = now.Format(time.RFC3339)
+			records[rowIndex][archiveReasonIndex] = reason
+		} else {
+			records[rowIndex][archivedAtIndex] = ""
+			records[rowIndex][archiveReasonIndex] = ""
+		}
+		updated = true
+		break
+	}
+	if !updated {
+		return fmt.Errorf("job not found in jobs.csv: %s", jobID)
+	}
+
+	tmpPath := path + ".tmp"
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("could not write jobs.csv: %w", err)
+	}
+	writer := csv.NewWriter(tmpFile)
+	if err := writer.Write(headers); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("could not write jobs.csv header: %w", err)
+	}
+	for rowIndex := 1; rowIndex < len(records); rowIndex++ {
+		row := normalizeCSVRecord(records[rowIndex], len(headers))
+		if err := writer.Write(row); err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("could not write jobs.csv row: %w", err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("could not flush jobs.csv: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("could not close jobs.csv tmp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("could not replace jobs.csv: %w", err)
+	}
+	return nil
+}
+
+func ensureCSVField(headers []string, field string) []string {
+	for _, header := range headers {
+		if header == field {
+			return headers
+		}
+	}
+	return append(headers, field)
+}
+
+func csvHeader(headers []string) map[string]int {
+	header := map[string]int{}
+	for index, field := range headers {
+		header[field] = index
+	}
+	return header
+}
+
+func normalizeCSVRecord(record []string, width int) []string {
+	normalized := make([]string, width)
+	copy(normalized, record)
+	return normalized
 }
 
 func runAnalyzer(ctx context.Context, appDir string, dryRun bool, ch chan tea.Msg) {
@@ -843,24 +1486,24 @@ func countJobURLs(raw string) int {
 	return count
 }
 
-func loadJobs(appDir string) ([]jobRow, stateSummary, error) {
+func loadJobs(appDir string) ([]jobRow, []jobRow, stateSummary, error) {
 	path := filepath.Join(appDir, "state", "jobs.csv")
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, stateSummary{}, nil
+			return nil, nil, stateSummary{}, nil
 		}
-		return nil, stateSummary{}, fmt.Errorf("could not read jobs.csv: %w", err)
+		return nil, nil, stateSummary{}, fmt.Errorf("could not read jobs.csv: %w", err)
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
 	records, err := reader.ReadAll()
 	if err != nil {
-		return nil, stateSummary{}, fmt.Errorf("could not parse jobs.csv: %w", err)
+		return nil, nil, stateSummary{}, fmt.Errorf("could not parse jobs.csv: %w", err)
 	}
 	if len(records) == 0 {
-		return nil, stateSummary{}, nil
+		return nil, nil, stateSummary{}, nil
 	}
 
 	header := map[string]int{}
@@ -868,49 +1511,74 @@ func loadJobs(appDir string) ([]jobRow, stateSummary, error) {
 		header[field] = i
 	}
 
-	rows := make([]jobRow, 0, len(records)-1)
+	activeRows := make([]jobRow, 0, len(records)-1)
+	archivedRows := make([]jobRow, 0)
 	var summary stateSummary
+	now := time.Now()
 	for _, record := range records[1:] {
 		row := jobRow{
-			id:        csvValue(record, header, "job_id"),
-			title:     csvValue(record, header, "title"),
-			company:   csvValue(record, header, "company"),
-			location:  csvValue(record, header, "location"),
-			status:    csvValue(record, header, "last_evaluation_status"),
-			score:     parseScore(csvValue(record, header, "fit_score")),
-			apply:     csvValue(record, header, "should_apply"),
-			reference: csvValue(record, header, "job_req_id"),
-			url:       csvValue(record, header, "job_url"),
-			lastSeen:  csvValue(record, header, "last_seen_at"),
-			closedAt:  csvValue(record, header, "closed_at"),
-			canApply:  csvValue(record, header, "can_apply"),
+			id:            csvValue(record, header, "job_id"),
+			title:         csvValue(record, header, "title"),
+			company:       csvValue(record, header, "company"),
+			location:      csvValue(record, header, "location"),
+			status:        csvValue(record, header, "last_evaluation_status"),
+			score:         parseScore(csvValue(record, header, "fit_score")),
+			apply:         csvValue(record, header, "should_apply"),
+			reference:     csvValue(record, header, "job_req_id"),
+			url:           csvValue(record, header, "job_url"),
+			lastSeen:      csvValue(record, header, "last_seen_at"),
+			closedAt:      csvValue(record, header, "closed_at"),
+			expiresAt:     csvValue(record, header, "expires_at"),
+			archivedAt:    csvValue(record, header, "archived_at"),
+			archiveReason: csvValue(record, header, "archive_reason"),
+			canApply:      csvValue(record, header, "can_apply"),
+			analysisPath:  csvValue(record, header, "analysis_path"),
 		}
-		rows = append(rows, row)
+		if row.title == "" {
+			row.title = row.url
+		}
+		if row.archiveReason == "" {
+			row.archiveReason = inferredArchiveReason(row, now)
+		}
+		if row.archivedAt == "" && row.archiveReason != "" {
+			row.archivedAt = inferredArchivedAt(row)
+		}
+		if row.analysisPath != "" {
+			row.analysis, row.analysisErr = loadJobAnalysis(appDir, row.analysisPath)
+		}
 		summary.total++
-		if row.score >= 0 {
-			summary.scored++
-		}
-		if strings.EqualFold(row.apply, "true") {
-			summary.apply++
-		}
-		switch row.status {
-		case "deferred":
-			summary.deferred++
-		case "cached":
-			summary.cached++
-		case "evaluated", "recalculated":
-			summary.evaluated++
-		case "error":
-			summary.errors++
+		archived := rowArchived(row)
+		if archived {
+			summary.archived++
+			archivedRows = append(archivedRows, row)
+		} else {
+			summary.active++
+			activeRows = append(activeRows, row)
+			if row.score >= 0 {
+				summary.scored++
+			}
+			if strings.EqualFold(row.apply, "true") {
+				summary.apply++
+			}
+			switch row.status {
+			case "deferred":
+				summary.deferred++
+			case "cached":
+				summary.cached++
+			case "evaluated", "recalculated":
+				summary.evaluated++
+			case "error":
+				summary.errors++
+			}
 		}
 		if row.status == "closed" || strings.EqualFold(row.canApply, "false") || row.closedAt != "" {
 			summary.closed++
 		}
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool {
-		left := rows[i]
-		right := rows[j]
+	sort.SliceStable(activeRows, func(i, j int) bool {
+		left := activeRows[i]
+		right := activeRows[j]
 		if left.score != right.score {
 			return left.score > right.score
 		}
@@ -920,7 +1588,19 @@ func loadJobs(appDir string) ([]jobRow, stateSummary, error) {
 		return left.title < right.title
 	})
 
-	return rows, summary, nil
+	sort.SliceStable(archivedRows, func(i, j int) bool {
+		left := archivedRows[i]
+		right := archivedRows[j]
+		if archiveSortTimestamp(left) != archiveSortTimestamp(right) {
+			return archiveSortTimestamp(left) > archiveSortTimestamp(right)
+		}
+		if left.score != right.score {
+			return left.score > right.score
+		}
+		return left.title < right.title
+	})
+
+	return activeRows, archivedRows, summary, nil
 }
 
 func loadReport(appDir string) ([]string, error) {
@@ -951,6 +1631,86 @@ func parseScore(raw string) int {
 		return -1
 	}
 	return score
+}
+
+func loadJobAnalysis(appDir string, analysisPath string) (jobAnalysis, string) {
+	cleaned := filepath.Clean(analysisPath)
+	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) || cleaned == ".." {
+		return jobAnalysis{}, "invalid analysis path"
+	}
+
+	data, err := os.ReadFile(filepath.Join(appDir, "state", cleaned))
+	if err != nil {
+		return jobAnalysis{}, fmt.Sprintf("could not read analysis: %v", err)
+	}
+
+	var payload analysisFile
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return jobAnalysis{}, fmt.Sprintf("could not parse analysis: %v", err)
+	}
+	return payload.Analysis, ""
+}
+
+func rowArchived(job jobRow) bool {
+	return strings.TrimSpace(job.archivedAt) != "" || strings.TrimSpace(job.archiveReason) != ""
+}
+
+func inferredArchiveReason(job jobRow, now time.Time) string {
+	if isExpiredAt(job.expiresAt, now) {
+		return "expired"
+	}
+	if strings.TrimSpace(job.closedAt) != "" || strings.EqualFold(job.status, "closed") || strings.EqualFold(job.canApply, "false") {
+		return "closed"
+	}
+	return ""
+}
+
+func inferredArchivedAt(job jobRow) string {
+	for _, value := range []string{job.closedAt, job.expiresAt, job.lastSeen} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func archiveSortTimestamp(job jobRow) string {
+	for _, value := range []string{job.archivedAt, job.closedAt, job.expiresAt, job.lastSeen} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isExpiredAt(raw string, now time.Time) bool {
+	expires, ok := parseDateInLocation(raw, now.Location())
+	return ok && expires.Before(dateOnly(now))
+}
+
+func parseDateInLocation(raw string, location *time.Location) (time.Time, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return time.Time{}, false
+	}
+
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05-07:00"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return dateOnly(parsed.In(location)), true
+		}
+	}
+
+	for _, layout := range []string{"2006-01-02", "01/02/2006", "Jan 2, 2006", "January 2, 2006"} {
+		if parsed, err := time.ParseInLocation(layout, value, location); err == nil {
+			return dateOnly(parsed), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func dateOnly(value time.Time) time.Time {
+	year, month, day := value.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, value.Location())
 }
 
 func applyText(job jobRow) string {
@@ -1010,6 +1770,32 @@ func boolText(value bool) string {
 
 func jobColumnWidths(width int) (int, int, int) {
 	remaining := max(36, width-40)
+	title := remaining * 3 / 10
+	company := remaining / 5
+	location := remaining - title - company
+
+	title = max(14, title)
+	company = max(12, company)
+	location = max(18, location)
+
+	for title+company+location > remaining {
+		switch {
+		case title >= company && title > 14:
+			title--
+		case company > location && company > 12:
+			company--
+		case location > 18:
+			location--
+		default:
+			title--
+		}
+	}
+
+	return title, company, location
+}
+
+func archivedColumnWidths(width int) (int, int, int) {
+	remaining := max(36, width-52)
 	title := remaining * 3 / 10
 	company := remaining / 5
 	location := remaining - title - company
@@ -1108,6 +1894,32 @@ func jobStatusStyle(status string) lipgloss.Style {
 		return warnStyle
 	case "error":
 		return errorStyle
+	case "closed":
+		return dimStyle
+	default:
+		return mutedStyle
+	}
+}
+
+func archiveReasonLabel(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "manual":
+		return "manual"
+	case "expired":
+		return "expired"
+	case "closed":
+		return "closed/non-applyable"
+	default:
+		return valueOrDash(reason)
+	}
+}
+
+func archiveReasonStyle(reason string) lipgloss.Style {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "manual":
+		return infoStyle
+	case "expired":
+		return warnStyle
 	case "closed":
 		return dimStyle
 	default:
@@ -1500,6 +2312,23 @@ func formatTime(value time.Time) string {
 		return "-"
 	}
 	return value.Format("2006-01-02 15:04:05")
+}
+
+func shortTimestamp(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05-07:00"} {
+		parsed, err := time.Parse(layout, value)
+		if err == nil {
+			return parsed.Format("2006-01-02 15:04")
+		}
+	}
+	if len(value) >= len("2006-01-02") {
+		return value[:len("2006-01-02")]
+	}
+	return value
 }
 
 func intFromAny(value any) int {
