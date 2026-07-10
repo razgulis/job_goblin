@@ -37,6 +37,11 @@ var screenNames = []string{"Dashboard", "Jobs", "Archived", "Run"}
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 var jobReferencePattern = regexp.MustCompile(`(?i)JR-\d+`)
 
+const (
+	scoringFreshWindow = 24 * time.Hour
+	scoringStaleWindow = 72 * time.Hour
+)
+
 var (
 	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 	activeTabStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("24")).Padding(0, 1)
@@ -111,6 +116,7 @@ type jobRow struct {
 	reference     string
 	url           string
 	lastSeen      string
+	lastEvaluated string
 	closedAt      string
 	expiresAt     string
 	archivedAt    string
@@ -122,16 +128,18 @@ type jobRow struct {
 }
 
 type stateSummary struct {
-	total     int
-	active    int
-	archived  int
-	scored    int
-	apply     int
-	deferred  int
-	cached    int
-	evaluated int
-	errors    int
-	closed    int
+	total           int
+	active          int
+	archived        int
+	scored          int
+	unscored        int
+	apply           int
+	deferred        int
+	cached          int
+	evaluated       int
+	errors          int
+	closed          int
+	latestEvaluated time.Time
 }
 
 type jobAnalysis struct {
@@ -413,12 +421,17 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.selectedArchived = 0
 		return m, nil
 	case "end", "G":
-		m.scroll = 1_000_000
-		if len(m.jobs) > 0 {
-			m.selectedJob = len(m.jobs) - 1
-		}
-		if len(m.archived) > 0 {
-			m.selectedArchived = len(m.archived) - 1
+		switch m.screen {
+		case screenRun:
+			m.scroll = m.maxRunScroll()
+		default:
+			m.scroll = 1_000_000
+			if len(m.jobs) > 0 {
+				m.selectedJob = len(m.jobs) - 1
+			}
+			if len(m.archived) > 0 {
+				m.selectedArchived = len(m.archived) - 1
+			}
 		}
 		return m, nil
 	}
@@ -454,19 +467,21 @@ func updateDetailKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.detailScroll = 0
 		m.status = "Loaded local state"
 	case "up", "k":
+		m.detailScroll = min(m.detailScroll, m.maxDetailScroll())
 		if m.detailScroll > 0 {
 			m.detailScroll--
 		}
 	case "down", "j":
-		m.detailScroll++
+		m.detailScroll = min(m.detailScroll+1, m.maxDetailScroll())
 	case "pgup":
+		m.detailScroll = min(m.detailScroll, m.maxDetailScroll())
 		m.detailScroll = max(0, m.detailScroll-max(1, m.contentHeight()-4))
 	case "pgdown":
-		m.detailScroll += max(1, m.contentHeight()-4)
+		m.detailScroll = min(m.detailScroll+max(1, m.contentHeight()-4), m.maxDetailScroll())
 	case "home", "g":
 		m.detailScroll = 0
 	case "end", "G":
-		m.detailScroll = 1_000_000
+		m.detailScroll = m.maxDetailScroll()
 	}
 	return m, nil
 }
@@ -550,6 +565,7 @@ func (m *model) moveUp() {
 			m.selectedArchived--
 		}
 	case screenRun:
+		m.scroll = min(m.scroll, m.maxRunScroll())
 		if m.scroll > 0 {
 			m.scroll--
 		}
@@ -567,7 +583,7 @@ func (m *model) moveDown() {
 			m.selectedArchived++
 		}
 	case screenRun:
-		m.scroll++
+		m.scroll = min(m.scroll+1, m.maxRunScroll())
 	}
 }
 
@@ -579,6 +595,7 @@ func (m *model) pageUp() {
 	case screenArchived:
 		m.selectedArchived = max(0, m.selectedArchived-step)
 	case screenRun:
+		m.scroll = min(m.scroll, m.maxRunScroll())
 		m.scroll = max(0, m.scroll-step)
 	}
 }
@@ -591,7 +608,7 @@ func (m *model) pageDown() {
 	case screenArchived:
 		m.selectedArchived = min(max(0, len(m.archived)-1), m.selectedArchived+step)
 	case screenRun:
-		m.scroll += step
+		m.scroll = min(m.scroll+step, m.maxRunScroll())
 	}
 }
 
@@ -693,6 +710,9 @@ func (m model) dashboardView() string {
 		keyValue("Active jobs", strconv.Itoa(m.state.active)),
 		keyValue("Archived jobs", mutedStyle.Render(strconv.Itoa(m.state.archived))),
 		keyValue("Scored jobs", strconv.Itoa(m.state.scored)),
+		keyValue("Unscored jobs", warnCount(m.state.unscored)),
+		keyValue("Scoring health", scoringHealthText(m.state, dashboardNow(m))),
+		keyValue("Scan recommendation", scanRecommendationText(m.state, dashboardNow(m))),
 		keyValue("Recommended apply", successStyle.Render(strconv.Itoa(m.state.apply))),
 		keyValue("Deferred", warnStyle.Render(strconv.Itoa(m.state.deferred))),
 		keyValue("Cached", infoStyle.Render(strconv.Itoa(m.state.cached))),
@@ -740,7 +760,8 @@ func (m model) jobsView() string {
 	titleW, companyW, locationW := jobColumnWidths(m.width)
 	refW := 11
 	statusW := 12
-	widths := []int{5, statusW, 6, refW, titleW, companyW, locationW}
+	expiresW := 10
+	widths := []int{5, statusW, expiresW, 6, refW, titleW, companyW, locationW}
 	lines := []string{
 		sectionStyle.Render(fmt.Sprintf("Jobs (%d active)", len(m.jobs))),
 		renderTableRow(
@@ -748,6 +769,7 @@ func (m model) jobsView() string {
 			[]tableCell{
 				{text: "Fit", style: tableHeadStyle, right: true},
 				{text: "Status", style: tableHeadStyle},
+				{text: "Expires", style: tableHeadStyle},
 				{text: "Apply", style: tableHeadStyle},
 				{text: "Ref", style: tableHeadStyle},
 				{text: "Title", style: tableHeadStyle},
@@ -769,6 +791,7 @@ func (m model) jobsView() string {
 		cells := []tableCell{
 			{text: score, style: scoreStyle(job.score), right: true},
 			{text: job.status, style: jobStatusStyle(job.status)},
+			{text: shortDate(job.expiresAt), style: expirationStyle(job.expiresAt, m.loaded)},
 			{text: applyText(job), style: applyStyle(job.apply)},
 			{text: jobReference(job), style: mutedStyle},
 			{text: job.title},
@@ -776,12 +799,10 @@ func (m model) jobsView() string {
 			{text: styledLocation(job.location)},
 		}
 		if i == m.selectedJob {
-			cells = highlightCells(cells)
+			lines = append(lines, truncateStyled(renderSelectedTableRow(widths, cells, m.width), m.width))
+			continue
 		}
 		line := renderTableRow(widths, cells, lipgloss.NewStyle())
-		if i == m.selectedJob {
-			line = selectedRowStyle.Render(padStyledLine(line, m.width))
-		}
 		lines = append(lines, truncateStyled(line, m.width))
 	}
 
@@ -868,12 +889,10 @@ func (m model) archivedView() string {
 			{text: styledLocation(job.location)},
 		}
 		if i == m.selectedArchived {
-			cells = highlightCells(cells)
+			lines = append(lines, truncateStyled(renderSelectedTableRow(widths, cells, m.width), m.width))
+			continue
 		}
 		line := renderTableRow(widths, cells, lipgloss.NewStyle())
-		if i == m.selectedArchived {
-			line = selectedRowStyle.Render(padStyledLine(line, m.width))
-		}
 		lines = append(lines, truncateStyled(line, m.width))
 	}
 
@@ -938,6 +957,7 @@ func renderJobDetailLines(job jobRow, width int) []string {
 		"",
 	}
 	lines = append(lines, detailField("Status", valueOrDash(job.status), width)...)
+	lines = append(lines, detailField("Expires", shortDate(job.expiresAt), width)...)
 	lines = append(lines, detailField("Fit score", scoreText, width)...)
 	lines = append(lines, detailField("Recommendation", recommendation, width)...)
 	lines = append(lines, detailField("Reference", jobReference(job), width)...)
@@ -1106,11 +1126,15 @@ func (m model) reportView() string {
 }
 
 func (m model) runView() string {
+	return scrollLines(m.runLines(), m.scroll, m.contentHeight(), m.width)
+}
+
+func (m model) runLines() []string {
 	lines := []string{}
 	if m.run == nil {
 		lines = append(lines, "No run has been started from this TUI session.")
 		lines = append(lines, "", "Press r for a full run or d for a dry run.")
-		return fitLines(lines, m.contentHeight(), m.width)
+		return lines
 	}
 
 	mode := "full"
@@ -1143,11 +1167,31 @@ func (m model) runView() string {
 
 	lines = append(lines, "", sectionStyle.Render("Log"))
 	lines = append(lines, m.run.logs...)
-	return scrollLines(lines, m.scroll, m.contentHeight(), m.width)
+	return lines
 }
 
 func (m model) contentHeight() int {
 	return max(1, m.height-5)
+}
+
+func (m model) maxRunScroll() int {
+	return maxScrollFor(m.runLines(), m.contentHeight())
+}
+
+func (m model) maxDetailScroll() int {
+	job, ok := m.detailJob()
+	if !ok {
+		return 0
+	}
+
+	boxWidth := max(4, m.width)
+	innerWidth := max(1, boxWidth-4)
+	innerHeight := max(1, m.contentHeight()-2)
+	return maxScrollFor(renderJobDetailLines(job, innerWidth), innerHeight)
+}
+
+func maxScrollFor(lines []string, height int) int {
+	return max(0, len(lines)-max(1, height))
 }
 
 func loadDataCmd(appDir string) tea.Cmd {
@@ -1527,6 +1571,7 @@ func loadJobs(appDir string) ([]jobRow, []jobRow, stateSummary, error) {
 			reference:     csvValue(record, header, "job_req_id"),
 			url:           csvValue(record, header, "job_url"),
 			lastSeen:      csvValue(record, header, "last_seen_at"),
+			lastEvaluated: csvValue(record, header, "last_evaluated_at"),
 			closedAt:      csvValue(record, header, "closed_at"),
 			expiresAt:     csvValue(record, header, "expires_at"),
 			archivedAt:    csvValue(record, header, "archived_at"),
@@ -1556,6 +1601,11 @@ func loadJobs(appDir string) ([]jobRow, []jobRow, stateSummary, error) {
 			activeRows = append(activeRows, row)
 			if row.score >= 0 {
 				summary.scored++
+			} else {
+				summary.unscored++
+			}
+			if evaluatedAt, ok := parseTimestampInLocation(row.lastEvaluated, now.Location()); ok && evaluatedAt.After(summary.latestEvaluated) {
+				summary.latestEvaluated = evaluatedAt
 			}
 			if strings.EqualFold(row.apply, "true") {
 				summary.apply++
@@ -1708,9 +1758,76 @@ func parseDateInLocation(raw string, location *time.Location) (time.Time, bool) 
 	return time.Time{}, false
 }
 
+func parseTimestampInLocation(raw string, location *time.Location) (time.Time, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return time.Time{}, false
+	}
+
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05-07:00"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.In(location), true
+		}
+	}
+
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if parsed, err := time.ParseInLocation(layout, value, location); err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
+}
+
 func dateOnly(value time.Time) time.Time {
 	year, month, day := value.Date()
 	return time.Date(year, month, day, 0, 0, 0, 0, value.Location())
+}
+
+func scoringHealthPercent(summary stateSummary, now time.Time) int {
+	if summary.active == 0 {
+		return 100
+	}
+
+	coverage := summary.scored * 100 / summary.active
+	freshness := scoringFreshnessPercent(summary.latestEvaluated, now)
+	return min(coverage, freshness)
+}
+
+func scoringFreshnessPercent(latest time.Time, now time.Time) int {
+	if latest.IsZero() {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if latest.After(now) {
+		return 100
+	}
+
+	age := now.Sub(latest)
+	switch {
+	case age <= scoringFreshWindow:
+		return 100
+	case age >= scoringStaleWindow:
+		return 0
+	default:
+		staleRange := scoringStaleWindow - scoringFreshWindow
+		remaining := scoringStaleWindow - age
+		return max(0, int(remaining*100/staleRange))
+	}
+}
+
+func scoringIsStale(summary stateSummary, now time.Time) bool {
+	if summary.active == 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if summary.latestEvaluated.IsZero() || summary.latestEvaluated.After(now) {
+		return summary.latestEvaluated.IsZero()
+	}
+	return now.Sub(summary.latestEvaluated) > scoringFreshWindow
 }
 
 func applyText(job jobRow) string {
@@ -1761,6 +1878,13 @@ func keyValue(key string, value string) string {
 	return mutedStyle.Render(fmt.Sprintf("%-26s", key+":")) + value
 }
 
+func dashboardNow(m model) time.Time {
+	if !m.loaded.IsZero() {
+		return m.loaded
+	}
+	return time.Now()
+}
+
 func boolText(value bool) string {
 	if value {
 		return successStyle.Render("yes")
@@ -1768,8 +1892,60 @@ func boolText(value bool) string {
 	return errorStyle.Render("no")
 }
 
+func warnCount(count int) string {
+	text := strconv.Itoa(count)
+	if count > 0 {
+		return warnStyle.Render(text)
+	}
+	return text
+}
+
+func scoringHealthText(summary stateSummary, now time.Time) string {
+	health := scoringHealthPercent(summary, now)
+	details := "no active jobs"
+	if summary.active > 0 {
+		parts := []string{fmt.Sprintf("%d/%d scored", summary.scored, summary.active)}
+		if summary.latestEvaluated.IsZero() {
+			parts = append(parts, "no scoring yet")
+		} else {
+			parts = append(parts, "last "+relativeAge(summary.latestEvaluated, now)+" ago")
+		}
+		details = strings.Join(parts, ", ")
+	}
+	return scoringHealthStyle(health).Render(fmt.Sprintf("%d%%", health)) + " " + mutedStyle.Render("("+details+")")
+}
+
+func scanRecommendationText(summary stateSummary, now time.Time) string {
+	if summary.active == 0 {
+		return mutedStyle.Render("No active jobs")
+	}
+
+	reasons := []string{}
+	if summary.unscored > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d unscored", summary.unscored))
+	}
+	if summary.deferred > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d deferred", summary.deferred))
+	}
+	if summary.errors > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d errors", summary.errors))
+	}
+	if scoringIsStale(summary, now) {
+		if summary.latestEvaluated.IsZero() {
+			reasons = append(reasons, "no scoring yet")
+		} else {
+			reasons = append(reasons, "last score "+relativeAge(summary.latestEvaluated, now)+" ago")
+		}
+	}
+	if len(reasons) == 0 {
+		return successStyle.Render("Current")
+	}
+
+	return scoringHealthStyle(scoringHealthPercent(summary, now)).Render("Press r") + " " + mutedStyle.Render("("+strings.Join(reasons, ", ")+")")
+}
+
 func jobColumnWidths(width int) (int, int, int) {
-	remaining := max(36, width-40)
+	remaining := max(36, width-51)
 	title := remaining * 3 / 10
 	company := remaining / 5
 	location := remaining - title - company
@@ -1840,18 +2016,29 @@ func renderTableRow(widths []int, cells []tableCell, rowStyle lipgloss.Style) st
 			cell = cells[i]
 		}
 		text := padCell(cell.text, width, cell.right)
-		parts = append(parts, cell.style.Render(text))
+		parts = append(parts, cell.style.Inherit(rowStyle).Render(text))
 	}
-	return rowStyle.Render(strings.Join(parts, " "))
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	out.WriteString(parts[0])
+	for _, part := range parts[1:] {
+		out.WriteString(rowStyle.Render(" "))
+		out.WriteString(part)
+	}
+	return out.String()
 }
 
-func highlightCells(cells []tableCell) []tableCell {
-	highlighted := make([]tableCell, len(cells))
-	copy(highlighted, cells)
-	for index := range highlighted {
-		highlighted[index].style = highlighted[index].style.Background(lipgloss.Color("252"))
+func renderSelectedTableRow(widths []int, cells []tableCell, width int) string {
+	line := renderTableRow(widths, cells, selectedRowStyle)
+	padding := max(0, width-ansi.StringWidth(line))
+	if padding > 0 {
+		line += selectedRowStyle.Render(strings.Repeat(" ", padding))
 	}
-	return highlighted
+	return line
 }
 
 func padStyledLine(value string, width int) string {
@@ -1881,6 +2068,17 @@ func scoreStyle(score int) lipgloss.Style {
 		return scoreLowStyle
 	default:
 		return dimStyle
+	}
+}
+
+func scoringHealthStyle(percent int) lipgloss.Style {
+	switch {
+	case percent >= 90:
+		return successStyle.Bold(true)
+	case percent >= 60:
+		return warnStyle.Bold(true)
+	default:
+		return errorStyle.Bold(true)
 	}
 }
 
@@ -2314,6 +2512,44 @@ func formatTime(value time.Time) string {
 	return value.Format("2006-01-02 15:04:05")
 }
 
+func shortDate(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	if parsed, ok := parseDateInLocation(value, time.Now().Location()); ok {
+		return parsed.Format("2006-01-02")
+	}
+	if len(value) >= len("2006-01-02") {
+		return value[:len("2006-01-02")]
+	}
+	return value
+}
+
+func expirationStyle(value string, now time.Time) lipgloss.Style {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return dimStyle
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	expires, ok := parseDateInLocation(value, now.Location())
+	if !ok {
+		return mutedStyle
+	}
+
+	today := dateOnly(now)
+	switch {
+	case expires.Before(today):
+		return errorStyle
+	case !expires.After(today.AddDate(0, 0, 7)):
+		return warnStyle
+	default:
+		return mutedStyle
+	}
+}
+
 func shortTimestamp(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -2329,6 +2565,30 @@ func shortTimestamp(value string) string {
 		return value[:len("2006-01-02")]
 	}
 	return value
+}
+
+func relativeAge(value time.Time, now time.Time) string {
+	if value.IsZero() {
+		return "-"
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if value.After(now) {
+		return "now"
+	}
+
+	age := now.Sub(value)
+	switch {
+	case age < time.Minute:
+		return "0m"
+	case age < time.Hour:
+		return fmt.Sprintf("%dm", int(age/time.Minute))
+	case age < 48*time.Hour:
+		return fmt.Sprintf("%dh", int(age/time.Hour))
+	default:
+		return fmt.Sprintf("%dd", int(age/(24*time.Hour)))
+	}
 }
 
 func intFromAny(value any) int {

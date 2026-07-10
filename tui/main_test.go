@@ -3,8 +3,12 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestReadDotEnvMultilineQuotedValue(t *testing.T) {
@@ -126,6 +130,129 @@ closed-1,https://example.com/c,https://example.com/c,Closed Job,Example Co,USA R
 	}
 	if archived[1].archiveReason != "closed" {
 		t.Fatalf("second archived reason = %q, want closed", archived[1].archiveReason)
+	}
+}
+
+func TestJobsViewShowsExpirationColumn(t *testing.T) {
+	m := model{
+		width:  140,
+		height: 30,
+		screen: screenJobs,
+		loaded: time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+		jobs: []jobRow{
+			{
+				id:        "job-1",
+				title:     "Platform Engineer",
+				company:   "Example Co",
+				location:  "USA Remote",
+				status:    "evaluated",
+				score:     92,
+				apply:     "true",
+				reference: "JR-1",
+				url:       "https://example.com/jobs/1",
+				expiresAt: "2026-08-15",
+			},
+		},
+	}
+
+	view := ansi.Strip(m.jobsView())
+	if !strings.Contains(view, "Expires") {
+		t.Fatalf("jobs view did not include Expires header:\n%s", view)
+	}
+	if !strings.Contains(view, "2026-08-15") {
+		t.Fatalf("jobs view did not include expiration date:\n%s", view)
+	}
+}
+
+func TestRunScrollUpClampsFromBottom(t *testing.T) {
+	m := model{
+		width:  100,
+		height: 15,
+		screen: screenRun,
+		scroll: 1_000_000,
+		run: &runState{
+			startedAt: time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+			logs:      make([]string, 40),
+		},
+	}
+	for i := range m.run.logs {
+		m.run.logs[i] = "line"
+	}
+
+	maxScroll := m.maxRunScroll()
+	if maxScroll == 0 {
+		t.Fatal("test setup did not create scrollable run output")
+	}
+
+	m.moveUp()
+	if got, want := m.scroll, maxScroll-1; got != want {
+		t.Fatalf("scroll after moveUp = %d, want %d", got, want)
+	}
+}
+
+func TestDetailPageUpClampsFromBottom(t *testing.T) {
+	m := model{
+		width:        80,
+		height:       12,
+		screen:       screenJobs,
+		detailOpen:   true,
+		detailJobID:  "job-1",
+		detailScroll: 1_000_000,
+		jobs: []jobRow{
+			{
+				id:           "job-1",
+				title:        "Platform Engineer",
+				company:      "Example Co",
+				location:     "USA Remote",
+				status:       "evaluated",
+				score:        90,
+				apply:        "true",
+				url:          "https://example.com/jobs/1",
+				analysisPath: "analyses/job-1.json",
+				analysis: jobAnalysis{
+					Summary:             strings.Repeat("summary ", 120),
+					ExperienceAlignment: strings.Repeat("alignment ", 120),
+					MatchedSkills:       []string{strings.Repeat("matched ", 80)},
+					MissingSkills:       []string{strings.Repeat("missing ", 80)},
+					Concerns:            []string{strings.Repeat("concern ", 80)},
+				},
+			},
+		},
+	}
+
+	maxScroll := m.maxDetailScroll()
+	if maxScroll == 0 {
+		t.Fatal("test setup did not create scrollable detail output")
+	}
+
+	updated, _ := updateDetailKey(m, tea.KeyMsg{Type: tea.KeyPgUp})
+	got := updated.(model).detailScroll
+	step := max(1, m.contentHeight()-4)
+	want := max(0, maxScroll-step)
+	if got != want {
+		t.Fatalf("detailScroll after pgup = %d, want %d", got, want)
+	}
+}
+
+func TestScoringHealthTracksCoverageAndFreshness(t *testing.T) {
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+
+	withUnscored := stateSummary{
+		active:          4,
+		scored:          3,
+		latestEvaluated: now.Add(-2 * time.Hour),
+	}
+	if got := scoringHealthPercent(withUnscored, now); got != 75 {
+		t.Fatalf("scoringHealthPercent with unscored job = %d, want 75", got)
+	}
+
+	stale := stateSummary{
+		active:          4,
+		scored:          4,
+		latestEvaluated: now.Add(-48 * time.Hour),
+	}
+	if got := scoringHealthPercent(stale, now); got != 50 {
+		t.Fatalf("scoringHealthPercent with stale scoring = %d, want 50", got)
 	}
 }
 
