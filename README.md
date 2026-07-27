@@ -77,7 +77,7 @@ r       run the full analyzer
 d       run the analyzer in dry-run mode
 R       refresh local state and config
 tab     switch views
-1-4     jump to Dashboard, Jobs, Archived, or Run
+1-5     jump to Dashboard, Jobs, Archived, Run, or Settings
 arrows  scroll or move through jobs
 enter   show the selected job report from Jobs or Archived
 esc     close the selected job report
@@ -86,6 +86,15 @@ u       unarchive the selected job from Archived
 c       cancel an active run
 q       quit
 ```
+
+The Settings tab edits the resume, job sources, LLM connection, and run limits. Press
+`enter` to edit a field and `s` to save changes to `.env`. The API key is masked.
+When `.env` does not exist, the TUI opens Settings on startup. A run with missing
+required settings is redirected there instead of starting the analyzer.
+
+On `Job sources`, `enter` expands a one-URL-per-row editor in place with an empty
+add row at the top. On `Resume file`, `enter` browses the Markdown files under
+`resume/`.
 
 To build a reusable local binary:
 
@@ -125,9 +134,9 @@ https://workday.wd5.myworkdayjobs.com/en-US/Workday/search?q=principal%20enginee
 For compatibility with copied browser URLs, a Workday `/details/...` URL that includes a `q=` parameter is also treated as a search source. To avoid unexpectedly large LLM runs, searches are capped:
 
 ```env
-MAX_JOBS_PER_SOURCE=20
+MAX_JOBS_PER_SOURCE=100
 WORKDAY_PAGE_SIZE=20
-MAX_NEW_EVALUATIONS_PER_RUN=10
+MAX_NEW_EVALUATIONS_PER_RUN=40
 ```
 
 `MAX_JOBS_PER_SOURCE` limits how many postings are fetched from each configured source. `MAX_NEW_EVALUATIONS_PER_RUN` limits how many new or changed jobs are sent to the LLM in one run. If the evaluation cap is reached, the remaining jobs are recorded as deferred and become eligible on a later run.

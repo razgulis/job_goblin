@@ -55,6 +55,255 @@ func TestReadDotEnvInlineQuotedValue(t *testing.T) {
 	}
 }
 
+func TestLoadEnvSummaryUsesFirstRunDefaultsWithoutEnvFile(t *testing.T) {
+	summary, err := loadEnvSummary(t.TempDir())
+	if err != nil {
+		t.Fatalf("loadEnvSummary: %v", err)
+	}
+	if summary.exists {
+		t.Fatal("summary.exists = true, want false")
+	}
+
+	want := map[string]string{
+		"SCRAPE_TIMEOUT_SECONDS":      "20",
+		"LLM_TIMEOUT_SECONDS":         "60",
+		"MAX_JOBS_PER_SOURCE":         "100",
+		"WORKDAY_PAGE_SIZE":           "20",
+		"MAX_NEW_EVALUATIONS_PER_RUN": "40",
+	}
+	for key, expected := range want {
+		if got := summary.values[key]; got != expected {
+			t.Errorf("%s = %q, want %q", key, got, expected)
+		}
+	}
+}
+
+func TestWriteDotEnvValuesPreservesUnknownContentAndRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	writeFile(t, envPath, `# Keep this comment.
+CUSTOM_SETTING=keep-me
+RESUME_FILE=old.md
+JOB_URLS="
+https://jobs.example.com/old
+"
+LLM_API_KEY=old-key
+`)
+
+	values := defaultSettingsValues()
+	values["RESUME_FILE"] = "candidate.md"
+	values["JOB_URLS"] = "https://jobs.example.com/one, https://jobs.example.com/two"
+	values["LLM_API_KEY"] = "new-key"
+	if err := writeDotEnvValues(envPath, values); err != nil {
+		t.Fatalf("writeDotEnvValues: %v", err)
+	}
+
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read updated .env: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "# Keep this comment.") || !strings.Contains(content, "CUSTOM_SETTING=keep-me") {
+		t.Fatalf("unmanaged .env content was not preserved:\n%s", content)
+	}
+
+	roundTrip, err := readDotEnv(envPath)
+	if err != nil {
+		t.Fatalf("readDotEnv after update: %v", err)
+	}
+	if got := roundTrip["RESUME_FILE"]; got != "candidate.md" {
+		t.Errorf("RESUME_FILE = %q, want candidate.md", got)
+	}
+	if got := countJobURLs(roundTrip["JOB_URLS"]); got != 2 {
+		t.Errorf("JOB_URLS count = %d, want 2", got)
+	}
+	if got := roundTrip["LLM_API_KEY"]; got != "new-key" {
+		t.Errorf("LLM_API_KEY = %q, want new-key", got)
+	}
+}
+
+func TestFullRunRedirectsToSettingsWhenAPIKeyIsMissing(t *testing.T) {
+	values := defaultSettingsValues()
+	values["RESUME_FILE"] = "candidate.md"
+	values["JOB_URLS"] = "https://jobs.example.com/search"
+	env := envSummary{exists: true, values: values}
+	m := model{
+		screen:   screenDashboard,
+		env:      env,
+		settings: newSettingsForm(env),
+	}
+
+	updated, cmd := startRunIfConfigured(m, false)
+	got := updated.(model)
+	if cmd != nil {
+		t.Fatal("startRunIfConfigured returned a command for incomplete configuration")
+	}
+	if got.screen != screenSettings {
+		t.Fatalf("screen = %v, want Settings", got.screen)
+	}
+	if !strings.Contains(got.settings.err, "API key") {
+		t.Fatalf("settings error = %q, want API key guidance", got.settings.err)
+	}
+}
+
+func TestMissingEnvOpensSettingsOnInitialRefresh(t *testing.T) {
+	m := initialModel(t.TempDir())
+	env := envSummary{exists: false, values: defaultSettingsValues()}
+
+	updated, _ := m.Update(refreshMsg{env: env, loaded: time.Now()})
+	got := updated.(model)
+	if got.screen != screenSettings {
+		t.Fatalf("screen = %v, want Settings", got.screen)
+	}
+	if !strings.Contains(got.status, "Configure settings") {
+		t.Fatalf("status = %q, want configuration prompt", got.status)
+	}
+}
+
+func TestSettingsViewMasksAPIKeyAndKeepsSelectedFieldVisible(t *testing.T) {
+	values := defaultSettingsValues()
+	values["LLM_API_KEY"] = "secret-value"
+	env := envSummary{exists: true, values: values}
+	form := newSettingsForm(env)
+	form.selectKey("MAX_NEW_EVALUATIONS_PER_RUN")
+	m := model{
+		appDir:   "/tmp/job-goblin",
+		width:    100,
+		height:   14,
+		screen:   screenSettings,
+		env:      env,
+		settings: form,
+	}
+
+	view := ansi.Strip(m.settingsView())
+	if strings.Contains(view, "secret-value") {
+		t.Fatalf("settings view exposed the API key:\n%s", view)
+	}
+	if !strings.Contains(view, "Max evaluations/run") {
+		t.Fatalf("selected field was not visible in a short terminal:\n%s", view)
+	}
+}
+
+func TestSettingsEditingAcceptsGlobalShortcutCharacters(t *testing.T) {
+	env := envSummary{values: defaultSettingsValues()}
+	form := newSettingsForm(env)
+	form.selectKey("LLM_API_KEY")
+	form.editing = true
+	form.cursor = len([]rune(form.fields[form.selected].value))
+	form.editStartValue = form.fields[form.selected].value
+	m := model{screen: screenSettings, env: env, settings: form}
+
+	updated, _ := updateKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("qrd")})
+	got := updated.(model)
+	if value := got.settings.fields[got.settings.selected].value; value != "qrd" {
+		t.Fatalf("edited API key = %q, want qrd", value)
+	}
+}
+
+func TestJobSourcesExpandInlineWithTopAddEntry(t *testing.T) {
+	values := defaultSettingsValues()
+	values["JOB_URLS"] = "https://jobs.example.com/one, https://work.example.com/two"
+	env := envSummary{exists: true, values: values}
+	form := newSettingsForm(env)
+	form.selectKey("JOB_URLS")
+	m := model{
+		appDir:   "/tmp/job-goblin",
+		width:    100,
+		height:   20,
+		screen:   screenSettings,
+		env:      env,
+		settings: form,
+	}
+
+	collapsed := ansi.Strip(m.settingsView())
+	if !strings.Contains(collapsed, "2 URLs") {
+		t.Fatalf("collapsed settings did not show a source count:\n%s", collapsed)
+	}
+	if strings.Contains(collapsed, "https://jobs.example.com/one") {
+		t.Fatalf("collapsed settings still rendered sources as one scalar value:\n%s", collapsed)
+	}
+
+	updated, _, handled := updateSettingsNavigation(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled || !updated.settings.sourceExpanded {
+		t.Fatal("Enter did not expand Job sources")
+	}
+	view := ansi.Strip(updated.settingsView())
+	for _, expected := range []string{"> +", "https://jobs.example.com/one", "https://work.example.com/two", "LLM base URL"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("expanded source view missing %q:\n%s", expected, view)
+		}
+	}
+}
+
+func TestSelectedSettingRowHighlightsLabelValueAndFullWidth(t *testing.T) {
+	field := settingsField{key: "LLM_MODEL", label: "LLM model", value: "gpt-test"}
+	row := renderSettingRow(field, true, false, 0, 24, 60, 100)
+	plain := ansi.Strip(row)
+
+	if !strings.Contains(plain, "LLM model") || !strings.Contains(plain, "gpt-test") {
+		t.Fatalf("selected row did not contain its label and value: %q", plain)
+	}
+	if got := ansi.StringWidth(row); got != 100 {
+		t.Fatalf("selected row width = %d, want 100", got)
+	}
+}
+
+func TestJobSourceAddRowPrependsNewURLAndRemainsEmpty(t *testing.T) {
+	values := defaultSettingsValues()
+	values["JOB_URLS"] = "https://jobs.example.com/existing"
+	env := envSummary{exists: true, values: values}
+	form := newSettingsForm(env)
+	form.selectKey("JOB_URLS")
+	form.sourceExpanded = true
+	m := model{screen: screenSettings, env: env, settings: form}
+
+	m, _, _ = updateSourceNavigation(m, tea.KeyMsg{Type: tea.KeyEnter})
+	edited, _ := updateSourceEditKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("https://jobs.example.com/new")})
+	committed, _ := updateSourceEditKey(edited.(model), tea.KeyMsg{Type: tea.KeyEnter})
+	got := committed.(model)
+
+	urls := got.settings.sourceURLs()
+	if len(urls) != 2 || urls[0] != "https://jobs.example.com/new" {
+		t.Fatalf("source URLs = %#v, want new URL prepended", urls)
+	}
+	if got.settings.sourceInput != "" || got.settings.sourceSelected != 0 {
+		t.Fatalf("add row was not reset: input=%q selected=%d", got.settings.sourceInput, got.settings.sourceSelected)
+	}
+}
+
+func TestResumeBrowserListsMarkdownFilesAndSelectsFilename(t *testing.T) {
+	dir := t.TempDir()
+	resumeDir := filepath.Join(dir, "resume")
+	if err := os.MkdirAll(resumeDir, 0o755); err != nil {
+		t.Fatalf("mkdir resume: %v", err)
+	}
+	writeFile(t, filepath.Join(resumeDir, "second.md"), "second")
+	writeFile(t, filepath.Join(resumeDir, "first.md"), "first")
+	writeFile(t, filepath.Join(resumeDir, "ignored.txt"), "ignored")
+	writeFile(t, filepath.Join(resumeDir, "ignored.MD"), "ignored")
+
+	env := envSummary{exists: true, values: defaultSettingsValues()}
+	form := newSettingsForm(env)
+	form.selectKey("RESUME_FILE")
+	m := model{appDir: dir, screen: screenSettings, env: env, settings: form}
+
+	opened, _, handled := updateSettingsNavigation(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled || !opened.settings.resumeBrowsing {
+		t.Fatal("Enter did not open the resume browser")
+	}
+	if got := opened.settings.resumeFiles; len(got) != 2 || got[0] != "first.md" || got[1] != "second.md" {
+		t.Fatalf("resume files = %#v, want sorted Markdown files", got)
+	}
+
+	selected, _, _ := updateResumeBrowser(opened, tea.KeyMsg{Type: tea.KeyEnter})
+	if value := selected.settings.fields[selected.settings.selected].value; value != "first.md" {
+		t.Fatalf("selected resume = %q, want first.md", value)
+	}
+	if !selected.settings.dirty {
+		t.Fatal("selecting a resume did not mark settings dirty")
+	}
+}
+
 func TestJobReferencePrefersStateValue(t *testing.T) {
 	job := jobRow{
 		reference: "JR-0108404",

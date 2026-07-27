@@ -31,15 +31,23 @@ const (
 	screenJobs
 	screenArchived
 	screenRun
+	screenSettings
 )
 
-var screenNames = []string{"Dashboard", "Jobs", "Archived", "Run"}
+var screenNames = []string{"Dashboard", "Jobs", "Archived", "Run", "Settings"}
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 var jobReferencePattern = regexp.MustCompile(`(?i)JR-\d+`)
 
 const (
-	scoringFreshWindow = 24 * time.Hour
-	scoringStaleWindow = 72 * time.Hour
+	scoringFreshWindow             = 24 * time.Hour
+	scoringStaleWindow             = 72 * time.Hour
+	defaultLLMBaseURL              = "https://api.openai.com/v1"
+	defaultLLMModel                = "gpt-5.4"
+	defaultScrapeTimeoutSeconds    = "20"
+	defaultLLMTimeoutSeconds       = "60"
+	defaultMaxJobsPerSource        = "100"
+	defaultWorkdayPageSize         = "20"
+	defaultMaxNewEvaluationsPerRun = "40"
 )
 
 var (
@@ -59,6 +67,8 @@ var (
 	scoreHighStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 	scoreMidStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	scoreLowStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	fieldLabelStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "24", Dark: "39"})
+	cursorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("232")).Background(lipgloss.Color("229"))
 )
 
 type tableCell struct {
@@ -79,6 +89,7 @@ type model struct {
 	detailJobID      string
 	detailScroll     int
 	confirmArchive   bool
+	settings         settingsForm
 
 	env      envSummary
 	jobs     []jobRow
@@ -95,14 +106,47 @@ type model struct {
 }
 
 type envSummary struct {
+	exists                  bool
+	values                  map[string]string
 	resumeFile              string
 	model                   string
 	baseURL                 string
 	jobURLCount             int
+	scrapeTimeoutSeconds    string
+	llmTimeoutSeconds       string
 	maxJobsPerSource        string
 	workdayPageSize         string
 	maxNewEvaluationsPerRun string
 	hasAPIKey               bool
+}
+
+type settingsField struct {
+	key        string
+	label      string
+	value      string
+	savedValue string
+	secret     bool
+}
+
+type settingsForm struct {
+	fields         []settingsField
+	selected       int
+	cursor         int
+	editing        bool
+	dirty          bool
+	err            string
+	editStartValue string
+	sourceExpanded bool
+	sourceSelected int
+	sourceInput    string
+	resumeBrowsing bool
+	resumeFiles    []string
+	resumeSelected int
+}
+
+type configIssue struct {
+	key     string
+	message string
 }
 
 type jobRow struct {
@@ -199,6 +243,10 @@ type archiveDoneMsg struct {
 	err      string
 }
 
+type settingsSavedMsg struct {
+	err string
+}
+
 type tickMsg time.Time
 
 func main() {
@@ -244,7 +292,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadErr = msg.err
 		m.selectedJob = clampSelection(m.selectedJob, len(m.jobs))
 		m.selectedArchived = clampSelection(m.selectedArchived, len(m.archived))
-		if m.status == "" || strings.HasPrefix(m.status, "Loaded") || m.status == "Ready" {
+		if len(m.settings.fields) == 0 || !m.settings.dirty {
+			m.settings = newSettingsForm(m.env)
+		}
+		if !m.env.exists {
+			m.screen = screenSettings
+			m.status = "Configure settings before running a job search"
+		} else if m.status == "" || strings.HasPrefix(m.status, "Loaded") || m.status == "Ready" {
 			m.status = "Loaded local state"
 		}
 		return m, nil
@@ -297,6 +351,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailScroll = 0
 		return m, loadDataCmd(m.appDir)
 
+	case settingsSavedMsg:
+		if msg.err != "" {
+			m.settings.err = msg.err
+			m.status = "Could not save settings"
+			return m, nil
+		}
+		m.settings.editing = false
+		m.settings.dirty = false
+		m.settings.err = ""
+		m.status = "Settings saved"
+		return m, loadDataCmd(m.appDir)
+
 	case tickMsg:
 		if m.run != nil && m.run.running {
 			m.run.spinnerIndex = (m.run.spinnerIndex + 1) % len(spinnerFrames)
@@ -313,8 +379,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyName := key.String()
-	switch keyName {
-	case "ctrl+c", "q":
+	if keyName == "ctrl+c" {
+		if m.cancelRun != nil {
+			m.cancelRun()
+		}
+		return m, tea.Quit
+	}
+
+	if m.screen == screenSettings && m.settings.editing {
+		return updateSettingsKey(m, key)
+	}
+	if keyName == "q" {
 		if m.cancelRun != nil {
 			m.cancelRun()
 		}
@@ -326,6 +401,11 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.detailOpen {
 		return updateDetailKey(m, key)
+	}
+	if m.screen == screenSettings {
+		if updated, cmd, handled := updateSettingsNavigation(m, key); handled {
+			return updated, cmd
+		}
 	}
 
 	switch keyName {
@@ -353,6 +433,10 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenRun
 		m.scroll = 0
 		return m, nil
+	case "5":
+		m.screen = screenSettings
+		m.scroll = 0
+		return m, nil
 	case "R":
 		m.status = "Refreshing local state"
 		return m, loadDataCmd(m.appDir)
@@ -361,13 +445,13 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "A run is already in progress"
 			return m, nil
 		}
-		return startRun(m, false)
+		return startRunIfConfigured(m, false)
 	case "d":
 		if m.run != nil && m.run.running {
 			m.status = "A run is already in progress"
 			return m, nil
 		}
-		return startRun(m, true)
+		return startRunIfConfigured(m, true)
 	case "esc", "c":
 		if m.cancelRun != nil {
 			m.cancelRun()
@@ -437,6 +521,366 @@ func updateKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func updateSettingsNavigation(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
+	if len(m.settings.fields) == 0 {
+		m.settings = newSettingsForm(m.env)
+	}
+	if m.settings.resumeBrowsing {
+		return updateResumeBrowser(m, key)
+	}
+	if m.settings.sourceExpanded {
+		return updateSourceNavigation(m, key)
+	}
+
+	switch key.String() {
+	case "enter", "e":
+		field := m.settings.fields[m.settings.selected]
+		switch field.key {
+		case "RESUME_FILE":
+			return openResumeBrowser(m)
+		case "JOB_URLS":
+			m.settings.sourceExpanded = true
+			m.settings.sourceSelected = 0
+			m.settings.err = ""
+			m.status = "Job sources expanded"
+			return m, nil, true
+		}
+		m.settings.editing = true
+		m.settings.err = ""
+		m.settings.editStartValue = field.value
+		m.settings.cursor = len([]rune(field.value))
+		m.status = "Editing " + field.label
+		return m, nil, true
+	case "up", "k":
+		m.settings.moveSelection(-1)
+		return m, nil, true
+	case "down", "j":
+		m.settings.moveSelection(1)
+		return m, nil, true
+	case "s", "ctrl+s":
+		return saveSettings(m)
+	case "esc":
+		if m.settings.dirty {
+			m.settings = newSettingsForm(m.env)
+			m.status = "Unsaved settings changes discarded"
+		} else {
+			m.screen = screenDashboard
+			m.status = "Loaded local state"
+		}
+		return m, nil, true
+	}
+	return m, nil, false
+}
+
+func updateSettingsKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if len(m.settings.fields) == 0 {
+		m.settings = newSettingsForm(m.env)
+	}
+	if m.settings.sourceExpanded {
+		return updateSourceEditKey(m, key)
+	}
+
+	field := &m.settings.fields[m.settings.selected]
+	runes := []rune(field.value)
+	m.settings.cursor = min(max(0, m.settings.cursor), len(runes))
+
+	switch key.String() {
+	case "esc":
+		field.value = m.settings.editStartValue
+		m.settings.editing = false
+		m.settings.cursor = 0
+		m.settings.dirty = m.settings.hasChanges()
+		m.status = "Edit cancelled"
+	case "enter":
+		m.settings.finishEditing()
+		m.status = "Settings changed; press s to save"
+	case "tab":
+		m.settings.finishEditing()
+		m.settings.moveSelection(1)
+	case "shift+tab":
+		m.settings.finishEditing()
+		m.settings.moveSelection(-1)
+	case "ctrl+s":
+		m.settings.finishEditing()
+		updated, cmd, _ := saveSettings(m)
+		return updated, cmd
+	case "left":
+		m.settings.cursor = max(0, m.settings.cursor-1)
+	case "right":
+		m.settings.cursor = min(len(runes), m.settings.cursor+1)
+	case "home":
+		m.settings.cursor = 0
+	case "end":
+		m.settings.cursor = len(runes)
+	case "backspace":
+		if m.settings.cursor > 0 {
+			runes = append(runes[:m.settings.cursor-1], runes[m.settings.cursor:]...)
+			m.settings.cursor--
+			field.value = string(runes)
+			m.settings.dirty = m.settings.hasChanges()
+		}
+	case "delete":
+		if m.settings.cursor < len(runes) {
+			runes = append(runes[:m.settings.cursor], runes[m.settings.cursor+1:]...)
+			field.value = string(runes)
+			m.settings.dirty = m.settings.hasChanges()
+		}
+	case "ctrl+u":
+		field.value = ""
+		m.settings.cursor = 0
+		m.settings.dirty = m.settings.hasChanges()
+	default:
+		if len(key.Runes) > 0 {
+			inserted := cleanSettingInput(field.key, string(key.Runes))
+			if inserted != "" {
+				insertRunes := []rune(inserted)
+				runes = append(runes[:m.settings.cursor], append(insertRunes, runes[m.settings.cursor:]...)...)
+				m.settings.cursor += len(insertRunes)
+				field.value = string(runes)
+				m.settings.dirty = m.settings.hasChanges()
+			}
+		}
+	}
+
+	return m, nil
+}
+
+func updateSourceNavigation(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
+	urls := m.settings.sourceURLs()
+	maxSelection := len(urls)
+	switch key.String() {
+	case "enter", "e":
+		m.settings.editing = true
+		m.settings.err = ""
+		m.settings.sourceInput = ""
+		if m.settings.sourceSelected > 0 {
+			m.settings.sourceInput = urls[m.settings.sourceSelected-1]
+		}
+		m.settings.editStartValue = m.settings.sourceInput
+		m.settings.cursor = len([]rune(m.settings.sourceInput))
+		if m.settings.sourceSelected == 0 {
+			m.status = "Adding job source"
+		} else {
+			m.status = "Editing job source"
+		}
+		return m, nil, true
+	case "a":
+		m.settings.sourceSelected = 0
+		m.settings.editing = true
+		m.settings.sourceInput = ""
+		m.settings.editStartValue = ""
+		m.settings.cursor = 0
+		m.status = "Adding job source"
+		return m, nil, true
+	case "up", "k":
+		m.settings.sourceSelected = max(0, m.settings.sourceSelected-1)
+		return m, nil, true
+	case "down", "j":
+		m.settings.sourceSelected = min(maxSelection, m.settings.sourceSelected+1)
+		return m, nil, true
+	case "pgup":
+		m.settings.sourceSelected = max(0, m.settings.sourceSelected-max(1, m.contentHeight()-7))
+		return m, nil, true
+	case "pgdown":
+		m.settings.sourceSelected = min(maxSelection, m.settings.sourceSelected+max(1, m.contentHeight()-7))
+		return m, nil, true
+	case "home", "g":
+		m.settings.sourceSelected = 0
+		return m, nil, true
+	case "end", "G":
+		m.settings.sourceSelected = maxSelection
+		return m, nil, true
+	case "delete":
+		if m.settings.sourceSelected > 0 {
+			m.settings.removeSource(m.settings.sourceSelected - 1)
+			m.settings.sourceSelected = min(m.settings.sourceSelected, len(m.settings.sourceURLs()))
+			m.status = "Job source removed; press s to save"
+		}
+		return m, nil, true
+	case "s", "ctrl+s":
+		return saveSettings(m)
+	case "esc", "tab", "shift+tab":
+		m.settings.sourceExpanded = false
+		m.settings.sourceSelected = 0
+		m.status = "Job sources collapsed"
+		return m, nil, true
+	}
+	return m, nil, true
+}
+
+func updateSourceEditKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	runes := []rune(m.settings.sourceInput)
+	m.settings.cursor = min(max(0, m.settings.cursor), len(runes))
+
+	switch key.String() {
+	case "esc":
+		m.settings.sourceInput = m.settings.editStartValue
+		m.settings.editing = false
+		m.settings.cursor = 0
+		m.settings.editStartValue = ""
+		m.status = "Job source edit cancelled"
+	case "enter":
+		m.settings.commitSourceInput()
+		m.status = "Job sources changed; press s to save"
+	case "ctrl+s":
+		m.settings.commitSourceInput()
+		updated, cmd, _ := saveSettings(m)
+		return updated, cmd
+	case "left":
+		m.settings.cursor = max(0, m.settings.cursor-1)
+	case "right":
+		m.settings.cursor = min(len(runes), m.settings.cursor+1)
+	case "home":
+		m.settings.cursor = 0
+	case "end":
+		m.settings.cursor = len(runes)
+	case "backspace":
+		if m.settings.cursor > 0 {
+			runes = append(runes[:m.settings.cursor-1], runes[m.settings.cursor:]...)
+			m.settings.cursor--
+			m.settings.sourceInput = string(runes)
+		}
+	case "delete":
+		if m.settings.cursor < len(runes) {
+			runes = append(runes[:m.settings.cursor], runes[m.settings.cursor+1:]...)
+			m.settings.sourceInput = string(runes)
+		}
+	case "ctrl+u":
+		m.settings.sourceInput = ""
+		m.settings.cursor = 0
+	default:
+		if len(key.Runes) > 0 {
+			inserted := cleanSettingInput("JOB_URLS", string(key.Runes))
+			if inserted != "" {
+				insertRunes := []rune(inserted)
+				runes = append(runes[:m.settings.cursor], append(insertRunes, runes[m.settings.cursor:]...)...)
+				m.settings.cursor += len(insertRunes)
+				m.settings.sourceInput = string(runes)
+			}
+		}
+	}
+	return m, nil
+}
+
+func openResumeBrowser(m model) (model, tea.Cmd, bool) {
+	files, err := listResumeFiles(m.appDir)
+	if err != nil {
+		m.settings.err = err.Error()
+		m.status = "Could not browse resume files"
+		return m, nil, true
+	}
+	if len(files) == 0 {
+		m.settings.err = "No Markdown resume files were found under resume/"
+		m.status = "No resume files found"
+		return m, nil, true
+	}
+
+	m.settings.resumeFiles = files
+	m.settings.resumeSelected = 0
+	current := m.settings.fields[m.settings.selected].value
+	for i, name := range files {
+		if name == current {
+			m.settings.resumeSelected = i
+			break
+		}
+	}
+	m.settings.resumeBrowsing = true
+	m.settings.err = ""
+	m.status = "Choose a resume file"
+	return m, nil, true
+}
+
+func updateResumeBrowser(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
+	maxSelection := max(0, len(m.settings.resumeFiles)-1)
+	switch key.String() {
+	case "up", "k":
+		m.settings.resumeSelected = max(0, m.settings.resumeSelected-1)
+	case "down", "j":
+		m.settings.resumeSelected = min(maxSelection, m.settings.resumeSelected+1)
+	case "pgup":
+		m.settings.resumeSelected = max(0, m.settings.resumeSelected-max(1, m.contentHeight()-6))
+	case "pgdown":
+		m.settings.resumeSelected = min(maxSelection, m.settings.resumeSelected+max(1, m.contentHeight()-6))
+	case "home", "g":
+		m.settings.resumeSelected = 0
+	case "end", "G":
+		m.settings.resumeSelected = maxSelection
+	case "enter":
+		if len(m.settings.resumeFiles) > 0 {
+			field := &m.settings.fields[m.settings.selected]
+			field.value = m.settings.resumeFiles[m.settings.resumeSelected]
+			m.settings.dirty = m.settings.hasChanges()
+			m.settings.resumeBrowsing = false
+			m.status = "Resume selected; press s to save"
+		}
+	case "esc":
+		m.settings.resumeBrowsing = false
+		m.status = "Resume browser closed"
+	}
+	return m, nil, true
+}
+
+func listResumeFiles(appDir string) ([]string, error) {
+	resumeDir := filepath.Join(appDir, "resume")
+	entries, err := os.ReadDir(resumeDir)
+	if err != nil {
+		return nil, fmt.Errorf("could not read resume directory: %w", err)
+	}
+
+	var files []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		files = append(files, entry.Name())
+	}
+	sort.Slice(files, func(i int, j int) bool {
+		return strings.ToLower(files[i]) < strings.ToLower(files[j])
+	})
+	return files, nil
+}
+
+func saveSettings(m model) (model, tea.Cmd, bool) {
+	values := m.settings.values()
+	if issues := configurationIssues(values, false); len(issues) > 0 {
+		m.settings.err = issues[0].message
+		m.settings.selectKey(issues[0].key)
+		m.status = "Fix settings before saving"
+		return m, nil, true
+	}
+
+	m.settings.err = ""
+	m.status = "Saving settings"
+	return m, saveSettingsCmd(m.appDir, values), true
+}
+
+func startRunIfConfigured(m model, dryRun bool) (tea.Model, tea.Cmd) {
+	if m.settings.dirty {
+		m.screen = screenSettings
+		m.status = "Save or discard settings changes before running"
+		return m, nil
+	}
+
+	issues := configurationIssues(m.env.values, !dryRun)
+	if !m.env.exists || len(issues) > 0 {
+		m.screen = screenSettings
+		m.scroll = 0
+		if len(m.settings.fields) == 0 {
+			m.settings = newSettingsForm(m.env)
+		}
+		if len(issues) > 0 {
+			m.settings.selectKey(issues[0].key)
+			m.settings.err = issues[0].message
+			m.status = "Configure settings before running"
+		} else {
+			m.status = "Save settings before running"
+		}
+		return m, nil
+	}
+
+	return startRun(m, dryRun)
 }
 
 func updateArchiveConfirmation(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -627,6 +1071,8 @@ func (m model) View() string {
 		body = m.archivedView()
 	case screenRun:
 		body = m.runView()
+	case screenSettings:
+		body = m.settingsView()
 	default:
 		body = m.dashboardView()
 	}
@@ -679,6 +1125,22 @@ func (m model) footerView() string {
 			help = "enter details  a archive  arrows move  r run  R refresh  q quit"
 		case screenArchived:
 			help = "enter details  u unarchive  arrows move  r run  R refresh  q quit"
+		case screenSettings:
+			switch {
+			case m.settings.resumeBrowsing:
+				help = "enter select  arrows move  esc close  q quit"
+			case m.settings.sourceExpanded && m.settings.editing:
+				help = "enter finish  esc cancel edit  ctrl+u clear  ctrl+s save"
+			case m.settings.sourceExpanded:
+				help = "enter edit  a add  delete remove  arrows move  s save  esc collapse"
+			case m.settings.editing:
+				help = "enter finish  esc cancel edit  ctrl+u clear  ctrl+s save"
+			default:
+				help = "enter edit  arrows select  s save  esc discard  tab switch  q quit"
+				if len(m.settings.fields) > 0 && m.settings.fields[m.settings.selected].key == "RESUME_FILE" {
+					help = "enter browse  arrows select  s save  esc discard  tab switch  q quit"
+				}
+			}
 		}
 	}
 	status := m.status
@@ -701,6 +1163,8 @@ func (m model) dashboardView() string {
 		keyValue("Base URL", valueOrDash(m.env.baseURL)),
 		keyValue("API key configured", boolText(m.env.hasAPIKey)),
 		keyValue("Job URL sources", strconv.Itoa(m.env.jobURLCount)),
+		keyValue("Scrape timeout", secondsText(m.env.scrapeTimeoutSeconds)),
+		keyValue("LLM timeout", secondsText(m.env.llmTimeoutSeconds)),
 		keyValue("Max jobs/source", valueOrDash(m.env.maxJobsPerSource)),
 		keyValue("Workday page size", valueOrDash(m.env.workdayPageSize)),
 		keyValue("Max new evaluations/run", valueOrDash(m.env.maxNewEvaluationsPerRun)),
@@ -729,6 +1193,158 @@ func (m model) dashboardView() string {
 		lines = append(lines, "", errorStyle.Render("Load Error"), errorStyle.Render(m.loadErr))
 	}
 
+	return fitLines(lines, m.contentHeight(), m.width)
+}
+
+func (m model) settingsView() string {
+	if len(m.settings.fields) == 0 {
+		m.settings = newSettingsForm(m.env)
+	}
+	if m.settings.resumeBrowsing {
+		return m.resumeBrowserView()
+	}
+
+	labelWidth := min(28, max(18, m.width/3))
+	valueWidth := max(8, m.width-labelWidth-5)
+	fieldCount := len(m.settings.fields)
+	lines := []string{
+		sectionStyle.Render(fmt.Sprintf("Settings (%d/%d)", m.settings.selected+1, fieldCount)),
+		keyValue("File", filepath.Join(m.appDir, ".env")),
+	}
+	if !m.env.exists {
+		lines = append(lines, warnStyle.Render("No .env file exists yet. Complete the required settings and save."))
+	}
+	lines = append(lines, "")
+
+	var body []string
+	selectedLine := 0
+	for i := 0; i < fieldCount; i++ {
+		field := m.settings.fields[i]
+		editing := i == m.settings.selected && m.settings.editing && !m.settings.sourceExpanded
+		selected := i == m.settings.selected && !m.settings.sourceExpanded
+		if selected {
+			selectedLine = len(body)
+		}
+		body = append(body, renderSettingRow(field, selected, editing, m.settings.cursor, labelWidth, valueWidth, m.width))
+
+		if field.key != "JOB_URLS" || !m.settings.sourceExpanded {
+			continue
+		}
+
+		urls := m.settings.sourceURLs()
+		topSelected := m.settings.sourceSelected == 0
+		if topSelected {
+			selectedLine = len(body)
+		}
+		body = append(body, renderSourceRow(
+			"+",
+			"",
+			topSelected,
+			topSelected && m.settings.editing,
+			m.settings.sourceInput,
+			m.settings.cursor,
+			m.width,
+		))
+		for sourceIndex, sourceURL := range urls {
+			sourceSelected := m.settings.sourceSelected == sourceIndex+1
+			if sourceSelected {
+				selectedLine = len(body)
+			}
+			editValue := sourceURL
+			if sourceSelected && m.settings.editing {
+				editValue = m.settings.sourceInput
+			}
+			body = append(body, renderSourceRow(
+				strconv.Itoa(sourceIndex+1),
+				sourceURL,
+				sourceSelected,
+				sourceSelected && m.settings.editing,
+				editValue,
+				m.settings.cursor,
+				m.width,
+			))
+		}
+	}
+
+	bodyHeight := max(1, m.contentHeight()-len(lines)-3)
+	start := min(max(0, len(body)-bodyHeight), max(0, selectedLine-bodyHeight+1))
+	end := min(len(body), start+bodyHeight)
+	lines = append(lines, body[start:end]...)
+
+	if len(m.settings.fields) > 0 {
+		hint := settingsFieldHint(m.settings.fields[m.settings.selected].key)
+		if m.settings.sourceExpanded {
+			hint = "The empty first row adds a source. Enter edits; Delete removes the selected URL."
+		}
+		lines = append(lines, "", mutedStyle.Render(hint))
+	}
+	if m.settings.err != "" {
+		lines = append(lines, errorStyle.Render(m.settings.err))
+	} else if m.settings.dirty {
+		lines = append(lines, warnStyle.Render("Unsaved changes"))
+	}
+
+	return fitLines(lines, m.contentHeight(), m.width)
+}
+
+func renderSettingRow(field settingsField, selected bool, editing bool, cursor int, labelWidth int, valueWidth int, width int) string {
+	marker := " "
+	if selected {
+		marker = ">"
+	}
+	label := fieldLabelStyle.Width(labelWidth).Render(field.label)
+	value := settingsDisplayValue(field, editing, cursor, valueWidth)
+	line := marker + " " + label + " " + value
+	if selected && !editing {
+		return renderSelectedSettingsLine(line, width)
+	}
+	return line
+}
+
+func renderSourceRow(label string, storedValue string, selected bool, editing bool, editValue string, cursor int, width int) string {
+	valueWidth := max(8, width-10)
+	value := ansi.Truncate(storedValue, valueWidth, "...")
+	if editing {
+		value = settingsDisplayValue(settingsField{value: editValue}, true, cursor, valueWidth)
+	}
+	marker := " "
+	if selected {
+		marker = ">"
+	}
+	line := fmt.Sprintf("  %s %-3s %s", marker, label, value)
+	if selected && !editing {
+		return renderSelectedSettingsLine(line, width)
+	}
+	return line
+}
+
+func renderSelectedSettingsLine(line string, width int) string {
+	plain := ansi.Truncate(ansi.Strip(line), width, "")
+	return selectedRowStyle.Width(width).Render(plain)
+}
+
+func (m model) resumeBrowserView() string {
+	lines := []string{
+		sectionStyle.Render("Settings / Resume file"),
+		keyValue("Directory", filepath.Join(m.appDir, "resume")),
+		"",
+	}
+
+	fileHeight := max(1, m.contentHeight()-6)
+	start := min(max(0, len(m.settings.resumeFiles)-fileHeight), max(0, m.settings.resumeSelected-fileHeight+1))
+	end := min(len(m.settings.resumeFiles), start+fileHeight)
+	for i := start; i < end; i++ {
+		marker := " "
+		if i == m.settings.resumeSelected {
+			marker = ">"
+		}
+		line := marker + " " + m.settings.resumeFiles[i]
+		if i == m.settings.resumeSelected {
+			line = renderSelectedSettingsLine(line, m.width)
+		}
+		lines = append(lines, line)
+	}
+	lines = append(lines, "", mutedStyle.Render("Choose a Markdown file from resume/."))
 	return fitLines(lines, m.contentHeight(), m.width)
 }
 
@@ -1455,16 +2071,32 @@ func appendLog(logs []string, line string) []string {
 }
 
 func loadEnvSummary(appDir string) (envSummary, error) {
-	values, err := readDotEnv(filepath.Join(appDir, ".env"))
+	values := defaultSettingsValues()
+	fileValues, err := readDotEnv(filepath.Join(appDir, ".env"))
+	exists := true
 	if err != nil {
-		return envSummary{}, err
+		if !errors.Is(err, os.ErrNotExist) {
+			return envSummary{}, err
+		}
+		exists = false
+		fileValues = map[string]string{}
+	}
+	for key, value := range fileValues {
+		if strings.TrimSpace(value) == "" && values[key] != "" {
+			continue
+		}
+		values[key] = value
 	}
 
 	return envSummary{
+		exists:                  exists,
+		values:                  values,
 		resumeFile:              values["RESUME_FILE"],
 		model:                   values["LLM_MODEL"],
 		baseURL:                 values["LLM_BASE_URL"],
 		jobURLCount:             countJobURLs(values["JOB_URLS"]),
+		scrapeTimeoutSeconds:    values["SCRAPE_TIMEOUT_SECONDS"],
+		llmTimeoutSeconds:       values["LLM_TIMEOUT_SECONDS"],
 		maxJobsPerSource:        values["MAX_JOBS_PER_SOURCE"],
 		workdayPageSize:         values["WORKDAY_PAGE_SIZE"],
 		maxNewEvaluationsPerRun: values["MAX_NEW_EVALUATIONS_PER_RUN"],
@@ -1505,11 +2137,24 @@ func readDotEnv(path string) (map[string]string, error) {
 			}
 			value = strings.Join(collected, "\n")
 		} else {
-			value = strings.Trim(value, "\"'")
+			value = parseDotEnvScalar(value)
 		}
 		values[key] = strings.TrimSpace(value)
 	}
 	return values, nil
+}
+
+func parseDotEnvScalar(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+	}
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return strings.ReplaceAll(value[1:len(value)-1], `\'`, `'`)
+	}
+	return value
 }
 
 func isMultilineQuotedValue(value string) bool {
@@ -1517,7 +2162,11 @@ func isMultilineQuotedValue(value string) bool {
 }
 
 func countJobURLs(raw string) int {
-	count := 0
+	return len(splitJobURLs(raw))
+}
+
+func splitJobURLs(raw string) []string {
+	var values []string
 	for _, item := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '\n' || r == ','
 	}) {
@@ -1525,9 +2174,353 @@ func countJobURLs(raw string) int {
 		if value == "" || strings.HasPrefix(value, "#") {
 			continue
 		}
-		count++
+		values = append(values, value)
 	}
-	return count
+	return values
+}
+
+func defaultSettingsValues() map[string]string {
+	return map[string]string{
+		"RESUME_FILE":                 "",
+		"JOB_URLS":                    "",
+		"LLM_BASE_URL":                defaultLLMBaseURL,
+		"LLM_API_KEY":                 "",
+		"LLM_MODEL":                   defaultLLMModel,
+		"SCRAPE_TIMEOUT_SECONDS":      defaultScrapeTimeoutSeconds,
+		"LLM_TIMEOUT_SECONDS":         defaultLLMTimeoutSeconds,
+		"MAX_JOBS_PER_SOURCE":         defaultMaxJobsPerSource,
+		"WORKDAY_PAGE_SIZE":           defaultWorkdayPageSize,
+		"MAX_NEW_EVALUATIONS_PER_RUN": defaultMaxNewEvaluationsPerRun,
+	}
+}
+
+func newSettingsForm(env envSummary) settingsForm {
+	values := defaultSettingsValues()
+	for key, value := range env.values {
+		values[key] = value
+	}
+	values["JOB_URLS"] = strings.Join(splitJobURLs(values["JOB_URLS"]), ", ")
+
+	fields := []settingsField{
+		{key: "RESUME_FILE", label: "Resume file", value: values["RESUME_FILE"]},
+		{key: "JOB_URLS", label: "Job sources", value: values["JOB_URLS"]},
+		{key: "LLM_BASE_URL", label: "LLM base URL", value: values["LLM_BASE_URL"]},
+		{key: "LLM_API_KEY", label: "LLM API key", value: values["LLM_API_KEY"], secret: true},
+		{key: "LLM_MODEL", label: "LLM model", value: values["LLM_MODEL"]},
+		{key: "SCRAPE_TIMEOUT_SECONDS", label: "Scrape timeout (sec)", value: values["SCRAPE_TIMEOUT_SECONDS"]},
+		{key: "LLM_TIMEOUT_SECONDS", label: "LLM timeout (sec)", value: values["LLM_TIMEOUT_SECONDS"]},
+		{key: "MAX_JOBS_PER_SOURCE", label: "Max jobs per source", value: values["MAX_JOBS_PER_SOURCE"]},
+		{key: "WORKDAY_PAGE_SIZE", label: "Workday page size", value: values["WORKDAY_PAGE_SIZE"]},
+		{key: "MAX_NEW_EVALUATIONS_PER_RUN", label: "Max evaluations/run", value: values["MAX_NEW_EVALUATIONS_PER_RUN"]},
+	}
+	for i := range fields {
+		fields[i].savedValue = fields[i].value
+	}
+	return settingsForm{fields: fields}
+}
+
+func (form *settingsForm) moveSelection(delta int) {
+	if len(form.fields) == 0 {
+		return
+	}
+	form.selected = (form.selected + delta + len(form.fields)) % len(form.fields)
+	form.cursor = 0
+	form.err = ""
+}
+
+func (form *settingsForm) finishEditing() {
+	form.editing = false
+	form.cursor = 0
+	form.editStartValue = ""
+	form.dirty = form.hasChanges()
+}
+
+func (form settingsForm) hasChanges() bool {
+	for _, field := range form.fields {
+		if field.value != field.savedValue {
+			return true
+		}
+	}
+	return false
+}
+
+func (form settingsForm) values() map[string]string {
+	values := defaultSettingsValues()
+	for _, field := range form.fields {
+		values[field.key] = strings.TrimSpace(field.value)
+	}
+	return values
+}
+
+func (form *settingsForm) selectKey(key string) {
+	for i, field := range form.fields {
+		if field.key == key {
+			form.selected = i
+			form.cursor = 0
+			form.editing = false
+			form.sourceExpanded = false
+			form.resumeBrowsing = false
+			return
+		}
+	}
+}
+
+func (form settingsForm) sourceURLs() []string {
+	for _, field := range form.fields {
+		if field.key == "JOB_URLS" {
+			return splitJobURLs(field.value)
+		}
+	}
+	return nil
+}
+
+func (form *settingsForm) setSourceURLs(urls []string) {
+	for i := range form.fields {
+		if form.fields[i].key == "JOB_URLS" {
+			form.fields[i].value = strings.Join(urls, ", ")
+			form.dirty = form.hasChanges()
+			return
+		}
+	}
+}
+
+func (form *settingsForm) removeSource(index int) {
+	urls := form.sourceURLs()
+	if index < 0 || index >= len(urls) {
+		return
+	}
+	urls = append(urls[:index], urls[index+1:]...)
+	form.setSourceURLs(urls)
+}
+
+func (form *settingsForm) commitSourceInput() {
+	urls := form.sourceURLs()
+	entered := splitJobURLs(form.sourceInput)
+	if form.sourceSelected <= 0 {
+		urls = append(entered, urls...)
+		form.sourceSelected = 0
+	} else {
+		index := form.sourceSelected - 1
+		if index < len(urls) {
+			updated := make([]string, 0, len(urls)-1+len(entered))
+			updated = append(updated, urls[:index]...)
+			updated = append(updated, entered...)
+			updated = append(updated, urls[index+1:]...)
+			urls = updated
+			form.sourceSelected = min(form.sourceSelected, len(urls))
+		}
+	}
+	form.setSourceURLs(urls)
+	form.sourceInput = ""
+	form.editStartValue = ""
+	form.cursor = 0
+	form.editing = false
+}
+
+func cleanSettingInput(key string, value string) string {
+	value = strings.ReplaceAll(value, "\r", "")
+	if key == "JOB_URLS" {
+		return strings.ReplaceAll(value, "\n", ", ")
+	}
+	return strings.ReplaceAll(value, "\n", "")
+}
+
+func configurationIssues(values map[string]string, requireLLM bool) []configIssue {
+	if values == nil {
+		values = defaultSettingsValues()
+	}
+
+	var issues []configIssue
+	resumeFile := strings.TrimSpace(values["RESUME_FILE"])
+	switch {
+	case resumeFile == "":
+		issues = append(issues, configIssue{key: "RESUME_FILE", message: "Resume file is required"})
+	case filepath.IsAbs(resumeFile) || filepath.Base(resumeFile) != resumeFile:
+		issues = append(issues, configIssue{key: "RESUME_FILE", message: "Resume file must be a filename under resume/"})
+	case !strings.HasSuffix(strings.ToLower(resumeFile), ".md"):
+		issues = append(issues, configIssue{key: "RESUME_FILE", message: "Resume file must be a Markdown file"})
+	}
+
+	if countJobURLs(values["JOB_URLS"]) == 0 {
+		issues = append(issues, configIssue{key: "JOB_URLS", message: "At least one job source URL is required"})
+	}
+
+	if strings.TrimSpace(values["LLM_BASE_URL"]) == "" {
+		issues = append(issues, configIssue{key: "LLM_BASE_URL", message: "LLM base URL is required"})
+	}
+	if requireLLM {
+		apiKey := strings.TrimSpace(values["LLM_API_KEY"])
+		if apiKey == "" || apiKey == "replace-me" {
+			issues = append(issues, configIssue{key: "LLM_API_KEY", message: "A real LLM API key is required for a full run"})
+		}
+		if strings.TrimSpace(values["LLM_MODEL"]) == "" {
+			issues = append(issues, configIssue{key: "LLM_MODEL", message: "LLM model is required for a full run"})
+		}
+	}
+
+	positiveKeys := []string{
+		"SCRAPE_TIMEOUT_SECONDS",
+		"LLM_TIMEOUT_SECONDS",
+		"MAX_JOBS_PER_SOURCE",
+		"WORKDAY_PAGE_SIZE",
+	}
+	for _, key := range positiveKeys {
+		value, err := strconv.Atoi(strings.TrimSpace(values[key]))
+		if err != nil || value <= 0 {
+			issues = append(issues, configIssue{key: key, message: settingsLabel(key) + " must be a positive integer"})
+		}
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(values["MAX_NEW_EVALUATIONS_PER_RUN"]))
+	if err != nil || value < 0 {
+		issues = append(issues, configIssue{
+			key:     "MAX_NEW_EVALUATIONS_PER_RUN",
+			message: "Max evaluations/run must be a non-negative integer",
+		})
+	}
+
+	return issues
+}
+
+func settingsLabel(key string) string {
+	for _, field := range newSettingsForm(envSummary{}).fields {
+		if field.key == key {
+			return field.label
+		}
+	}
+	return key
+}
+
+func saveSettingsCmd(appDir string, values map[string]string) tea.Cmd {
+	return func() tea.Msg {
+		err := writeDotEnvValues(filepath.Join(appDir, ".env"), values)
+		msg := settingsSavedMsg{}
+		if err != nil {
+			msg.err = err.Error()
+		}
+		return msg
+	}
+}
+
+func writeDotEnvValues(path string, values map[string]string) error {
+	existing, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("could not read existing .env: %w", err)
+	}
+
+	content := updateDotEnvContent(string(existing), values)
+	temp, err := os.CreateTemp(filepath.Dir(path), ".env.tmp-*")
+	if err != nil {
+		return fmt.Errorf("could not create temporary .env: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return fmt.Errorf("could not secure temporary .env: %w", err)
+	}
+	if _, err := io.WriteString(temp, content); err != nil {
+		temp.Close()
+		return fmt.Errorf("could not write temporary .env: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("could not close temporary .env: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("could not replace .env: %w", err)
+	}
+	return nil
+}
+
+func updateDotEnvContent(existing string, values map[string]string) string {
+	keys := []string{
+		"RESUME_FILE",
+		"JOB_URLS",
+		"LLM_BASE_URL",
+		"LLM_API_KEY",
+		"LLM_MODEL",
+		"SCRAPE_TIMEOUT_SECONDS",
+		"LLM_TIMEOUT_SECONDS",
+		"MAX_JOBS_PER_SOURCE",
+		"WORKDAY_PAGE_SIZE",
+		"MAX_NEW_EVALUATIONS_PER_RUN",
+	}
+	known := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		known[key] = true
+	}
+
+	var lines []string
+	if existing != "" {
+		lines = strings.Split(strings.TrimRight(existing, "\n"), "\n")
+	}
+	var output []string
+	seen := map[string]bool{}
+	for i := 0; i < len(lines); i++ {
+		key, rawValue, ok := dotEnvAssignment(lines[i])
+		if !ok || !known[key] {
+			output = append(output, lines[i])
+			continue
+		}
+
+		if !seen[key] {
+			output = append(output, strings.Split(renderDotEnvSetting(key, values[key]), "\n")...)
+			seen[key] = true
+		}
+		if isMultilineQuotedValue(rawValue) {
+			for i+1 < len(lines) {
+				i++
+				if strings.HasSuffix(strings.TrimSpace(lines[i]), "\"") {
+					break
+				}
+			}
+		}
+	}
+
+	if len(output) > 0 && strings.TrimSpace(output[len(output)-1]) != "" {
+		output = append(output, "")
+	}
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		output = append(output, strings.Split(renderDotEnvSetting(key, values[key]), "\n")...)
+	}
+	return strings.TrimRight(strings.Join(output, "\n"), "\n") + "\n"
+}
+
+func dotEnvAssignment(line string) (string, string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return "", "", false
+	}
+	parts := strings.SplitN(trimmed, "=", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", "", false
+	}
+	return key, strings.TrimSpace(parts[1]), true
+}
+
+func renderDotEnvSetting(key string, value string) string {
+	value = strings.TrimSpace(value)
+	if key == "JOB_URLS" {
+		urls := splitJobURLs(value)
+		if len(urls) == 0 {
+			return key + "=\"\""
+		}
+		return key + "=\"\n" + strings.Join(urls, "\n") + "\n\""
+	}
+	if value == "" {
+		return key + "="
+	}
+	if strings.ContainsAny(value, " \t\r\n#\"'") {
+		return key + "=" + strconv.Quote(value)
+	}
+	return key + "=" + value
 }
 
 func loadJobs(appDir string) ([]jobRow, []jobRow, stateSummary, error) {
@@ -1892,6 +2885,77 @@ func boolText(value bool) string {
 	return errorStyle.Render("no")
 }
 
+func secondsText(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value + " seconds"
+}
+
+func settingsDisplayValue(field settingsField, editing bool, cursor int, width int) string {
+	if !editing {
+		if field.key == "JOB_URLS" {
+			count := countJobURLs(field.value)
+			if count == 1 {
+				return "1 URL"
+			}
+			return fmt.Sprintf("%d URLs", count)
+		}
+		if field.secret {
+			if strings.TrimSpace(field.value) == "" || field.value == "replace-me" {
+				return errorStyle.Render("[not set]")
+			}
+			return successStyle.Render("[configured]")
+		}
+		if field.value == "" {
+			return dimStyle.Render("[not set]")
+		}
+		return ansi.Truncate(field.value, width, "...")
+	}
+
+	runes := []rune(field.value)
+	if field.secret {
+		runes = []rune(strings.Repeat("*", len(runes)))
+	}
+	cursor = min(max(0, cursor), len(runes))
+	visibleWidth := max(1, width-1)
+	start := 0
+	if cursor >= visibleWidth {
+		start = cursor - visibleWidth + 1
+	}
+	end := min(len(runes), start+visibleWidth)
+
+	var before, at, after string
+	if cursor < len(runes) {
+		before = string(runes[start:cursor])
+		at = string(runes[cursor])
+		after = string(runes[cursor+1 : end])
+	} else {
+		before = string(runes[start:end])
+		at = " "
+	}
+	return before + cursorStyle.Render(at) + after
+}
+
+func settingsFieldHint(key string) string {
+	switch key {
+	case "RESUME_FILE":
+		return "Press Enter to browse Markdown resumes under resume/."
+	case "JOB_URLS":
+		return "Press Enter to expand and manage one source URL per row."
+	case "LLM_BASE_URL":
+		return "Base URL for an OpenAI-compatible API."
+	case "LLM_API_KEY":
+		return "Required for full runs; masked on screen and stored only in .env."
+	case "LLM_MODEL":
+		return "Model name sent to the configured LLM API."
+	case "MAX_NEW_EVALUATIONS_PER_RUN":
+		return "May be zero; all other numeric settings must be greater than zero."
+	default:
+		return "Numeric value used by the analyzer."
+	}
+}
+
 func warnCount(count int) string {
 	text := strconv.Itoa(count)
 	if count > 0 {
@@ -2165,13 +3229,15 @@ func isUSLocationPart(location string) bool {
 func statusStyle(status string) lipgloss.Style {
 	normalized := strings.ToLower(status)
 	switch {
-	case strings.Contains(normalized, "fail"), strings.Contains(normalized, "error"):
+	case strings.Contains(normalized, "fail"), strings.Contains(normalized, "error"), strings.Contains(normalized, "could not"):
 		return errorStyle
-	case strings.Contains(normalized, "cancel"):
+	case strings.Contains(normalized, "cancel"), strings.Contains(normalized, "configure"), strings.Contains(normalized, "missing"),
+		strings.Contains(normalized, "fix"), strings.Contains(normalized, "unsaved"), strings.Contains(normalized, "discard"):
 		return warnStyle
-	case strings.Contains(normalized, "start"), strings.Contains(normalized, "run"):
+	case strings.Contains(normalized, "start"), strings.Contains(normalized, "run"), strings.Contains(normalized, "saving"):
 		return infoStyle
-	case strings.Contains(normalized, "complete"), strings.Contains(normalized, "loaded"), strings.Contains(normalized, "ready"):
+	case strings.Contains(normalized, "complete"), strings.Contains(normalized, "loaded"), strings.Contains(normalized, "ready"),
+		strings.Contains(normalized, "saved"):
 		return successStyle
 	default:
 		return mutedStyle
