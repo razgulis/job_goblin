@@ -57,9 +57,152 @@ class CaptureCreate:
         self.response = response
         self.requests: list[dict[str, object]] = []
 
-    def create(self, **kwargs: object) -> object:
+    def create(self, *args: object, **kwargs: object) -> object:
+        if args:
+            kwargs["_args"] = args
         self.requests.append(kwargs)
         return self.response
+
+
+class CaptureEvents:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict[str, object]]] = []
+
+    def log(
+        self,
+        event_type: str,
+        message: str,
+        **fields: object,
+    ) -> None:
+        self.events.append((event_type, message, fields))
+
+
+class WorkdayURLTests(unittest.TestCase):
+    def test_jobs_url_with_facets_and_no_search_text_is_a_collection(self) -> None:
+        url = (
+            "https://workday.wd5.myworkdayjobs.com/en-US/Workday/jobs"
+            "?redirect=/en-US/Workday/userHome"
+            "&locations=4d3a30f878c5011d15d8cafbd5810000"
+            "&locations=62a48cfecb41101e2011999af07c4fdb"
+        )
+
+        source = analyze_jobs.parse_workday_search_source(url)
+
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.tenant, "workday")
+        self.assertEqual(source.site, "Workday")
+        self.assertEqual(source.search_text, "")
+        self.assertEqual(
+            source.applied_facets,
+            {
+                "locations": [
+                    "4d3a30f878c5011d15d8cafbd5810000",
+                    "62a48cfecb41101e2011999af07c4fdb",
+                ]
+            },
+        )
+
+    def test_crowdstrike_jobs_url_preserves_search_and_location(self) -> None:
+        url = (
+            "https://crowdstrike.wd5.myworkdayjobs.com/en-US/"
+            "crowdstrikecareers/jobs?q=-analyst+-sales+-manager"
+            "&locations=20feac86ebdd0102586dc95b42138d6f"
+        )
+
+        source = analyze_jobs.parse_workday_search_source(url)
+
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.tenant, "crowdstrike")
+        self.assertEqual(source.site, "crowdstrikecareers")
+        self.assertEqual(source.search_text, "-analyst -sales -manager")
+        self.assertEqual(
+            source.applied_facets,
+            {"locations": ["20feac86ebdd0102586dc95b42138d6f"]},
+        )
+
+    def test_nvidia_jobs_url_is_a_collection(self) -> None:
+        url = (
+            "https://nvidia.wd5.myworkdayjobs.com/en-US/"
+            "nvidiaexternalcareersite/jobs?q=Engineer"
+            "&locations=d2088e737cbb01d5e2be9e52ce01926f"
+            "&locations=91336993fab910af6d712ddeebf4c38e"
+        )
+
+        source = analyze_jobs.parse_workday_search_source(url)
+
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.tenant, "nvidia")
+        self.assertEqual(source.site, "nvidiaexternalcareersite")
+        self.assertEqual(source.search_text, "Engineer")
+        self.assertEqual(len(source.applied_facets["locations"]), 2)
+
+    def test_direct_workday_job_url_is_not_treated_as_a_collection(self) -> None:
+        url = (
+            "https://example.wd5.myworkdayjobs.com/en-US/site/"
+            "job/Atlanta/Platform-Engineer_R123"
+        )
+
+        self.assertIsNone(analyze_jobs.parse_workday_search_source(url))
+
+    def test_collection_payload_supports_empty_search_text(self) -> None:
+        source = analyze_jobs.WorkdaySearchSource(
+            original_url="https://example.wd5.myworkdayjobs.com/en-US/site/jobs",
+            base_url="https://example.wd5.myworkdayjobs.com",
+            tenant="example",
+            site="site",
+            locale="en-US",
+            search_text="",
+            applied_facets={"locations": ["location-id"]},
+        )
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"total": 0, "jobPostings": []},
+        )
+        post = CaptureCreate(response)
+        session = SimpleNamespace(post=post.create)
+
+        postings, total = analyze_jobs.list_workday_postings(
+            session,
+            source,
+            make_config(),
+        )
+
+        self.assertEqual(postings, [])
+        self.assertEqual(total, 0)
+        request = post.requests[0]
+        self.assertEqual(request["json"]["searchText"], "")  # type: ignore[index]
+        self.assertEqual(
+            request["json"]["appliedFacets"],  # type: ignore[index]
+            {"locations": ["location-id"]},
+        )
+
+    def test_legacy_search_page_placeholder_is_removed(self) -> None:
+        url = "https://example.wd5.myworkdayjobs.com/en-US/site/jobs?q=Engineer"
+        job_id = f"url:{analyze_jobs.stable_hash(url)}"
+        state = {
+            job_id: {
+                "job_id": job_id,
+                "source_url": url,
+                "job_url": url,
+                "job_req_id": "",
+                "title": "Careers at Example",
+            }
+        }
+        events = CaptureEvents()
+
+        removed = analyze_jobs.remove_legacy_source_placeholder(
+            state,
+            url,
+            False,
+            events,
+        )
+
+        self.assertTrue(removed)
+        self.assertNotIn(job_id, state)
+        self.assertEqual(events.events[0][0], "legacy_source_placeholder_removed")
 
 
 class AnalyzerLLMTests(unittest.TestCase):

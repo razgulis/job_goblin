@@ -134,7 +134,10 @@ to omit the reasoning parameter for a provider or model that does not support
 it. Changing the model, provider, API mode, reasoning effort, resume, or
 evaluation prompt invalidates cached job scores.
 
-Workday search URLs are expanded through Workday's public jobs API. A URL like this is treated as a search source:
+Workday `/jobs` and `/search` collection URLs are expanded through Workday's
+public jobs API. Search text is optional, so URLs containing only location or
+other facet filters are also supported. A URL like this is treated as a search
+source:
 
 ```env
 JOB_URLS="

@@ -153,6 +153,7 @@ class SourceScrapeResult:
     source_url: str
     jobs: list[ScrapedJob]
     total_available: int
+    is_collection: bool = False
 
 
 @dataclass(frozen=True)
@@ -295,6 +296,13 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         scraped_jobs = source_result.jobs
+        if source_result.is_collection:
+            remove_legacy_source_placeholder(
+                updated_state,
+                source_url,
+                args.dry_run,
+                events,
+            )
         total_jobs = len(scraped_jobs)
         if source_result.total_available > total_jobs:
             stats.truncated_sources += 1
@@ -946,27 +954,30 @@ class WorkdaySearchSource:
 
 def parse_workday_search_source(url: str) -> WorkdaySearchSource | None:
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
     path_parts = [part for part in parsed.path.split("/") if part]
     query = parse_qs(parsed.query)
     search_text = query.get("q", [""])[0].strip()
-
-    if not host.endswith("myworkdayjobs.com") or not search_text:
-        return None
-    if len(path_parts) < 2:
-        return None
-
-    is_search_url = len(path_parts) >= 3 and path_parts[2] == "search"
-    is_detail_with_search = len(path_parts) >= 3 and path_parts[2] == "details"
-    if not is_search_url and not is_detail_with_search:
-        return None
-
-    tenant = host.split(".", maxsplit=1)[0]
     applied_facets = {
         key: [value for value in values if value]
         for key, values in query.items()
         if key not in {"q", "redirect"} and any(values)
     }
+
+    if not host.endswith("myworkdayjobs.com"):
+        return None
+    if len(path_parts) < 2:
+        return None
+
+    page_kind = path_parts[2].lower() if len(path_parts) >= 3 else ""
+    is_search_url = page_kind in {"jobs", "search"}
+    is_detail_with_search = page_kind == "details" and bool(
+        search_text or applied_facets
+    )
+    if not is_search_url and not is_detail_with_search:
+        return None
+
+    tenant = host.split(".", maxsplit=1)[0]
     return WorkdaySearchSource(
         original_url=url,
         base_url=f"{parsed.scheme}://{parsed.netloc}",
@@ -976,6 +987,37 @@ def parse_workday_search_source(url: str) -> WorkdaySearchSource | None:
         search_text=search_text,
         applied_facets=applied_facets,
     )
+
+
+def remove_legacy_source_placeholder(
+    state: dict[str, dict[str, str]],
+    source_url: str,
+    dry_run: bool,
+    events: EventSink,
+) -> bool:
+    job_id = f"url:{stable_hash(source_url)}"
+    row = state.get(job_id)
+    if not row:
+        return False
+    if (
+        row.get("source_url") != source_url
+        or row.get("job_url") != source_url
+        or row.get("job_req_id")
+    ):
+        return False
+
+    del state[job_id]
+    action = "Would remove" if dry_run else "Removed"
+    events.log(
+        "legacy_source_placeholder_removed",
+        f"{action} invalid cached Workday search-page entry: "
+        f"{row.get('title') or source_url}",
+        job_id=job_id,
+        title=row.get("title", ""),
+        url=source_url,
+        dry_run=dry_run,
+    )
+    return True
 
 
 def scrape_workday_search(
@@ -1041,6 +1083,7 @@ def scrape_workday_search(
         source_url=source.original_url,
         jobs=jobs,
         total_available=total_available,
+        is_collection=True,
     )
 
 
