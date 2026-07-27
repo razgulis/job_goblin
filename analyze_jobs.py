@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
-import os
 import argparse
 import csv
 import hashlib
+import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -30,6 +30,9 @@ STATE_PATH = STATE_DIR / "jobs.csv"
 ANALYSES_DIR = STATE_DIR / "analyses"
 
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_LLM_MODEL = "gpt-5.6-terra"
+DEFAULT_LLM_API_MODE = "responses"
+DEFAULT_LLM_REASONING_EFFORT = "medium"
 DEFAULT_SCRAPE_TIMEOUT_SECONDS = 20
 DEFAULT_LLM_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_JOBS_PER_SOURCE = 100
@@ -37,6 +40,50 @@ DEFAULT_WORKDAY_PAGE_SIZE = 20
 DEFAULT_MAX_NEW_EVALUATIONS_PER_RUN = 40
 MAX_RESUME_CHARS = 30_000
 MAX_JOB_TEXT_CHARS = 35_000
+EVALUATION_PROMPT_VERSION = "2026-07-27-v1"
+
+LLM_API_MODES = {"responses", "chat_completions"}
+LLM_REASONING_EFFORTS = {
+    "default",
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+}
+
+JOB_EVALUATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "job_title": {"type": "string"},
+        "company": {"type": "string"},
+        "fit_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "should_apply": {"type": "boolean"},
+        "summary": {"type": "string"},
+        "matched_skills": {"type": "array", "items": {"type": "string"}},
+        "missing_skills": {"type": "array", "items": {"type": "string"}},
+        "experience_alignment": {"type": "string"},
+        "concerns": {"type": "array", "items": {"type": "string"}},
+        "recommended_resume_tweaks": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "job_title",
+        "company",
+        "fit_score",
+        "should_apply",
+        "summary",
+        "matched_skills",
+        "missing_skills",
+        "experience_alignment",
+        "concerns",
+        "recommended_resume_tweaks",
+    ],
+}
 
 STATE_FIELDS = [
     "job_id",
@@ -61,6 +108,9 @@ STATE_FIELDS = [
     "last_evaluated_at",
     "analysis_path",
     "model",
+    "api_mode",
+    "reasoning_effort",
+    "evaluation_fingerprint",
     "last_evaluation_status",
 ]
 
@@ -73,6 +123,8 @@ class Config:
     llm_base_url: str
     llm_api_key: str
     llm_model: str
+    llm_api_mode: str
+    llm_reasoning_effort: str
     scrape_timeout_seconds: int
     llm_timeout_seconds: int
     max_jobs_per_source: int
@@ -165,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(require_llm=not args.dry_run)
         resume_text = read_text(config.resume_path)
+        resume_hash = hashlib.sha256(resume_text.encode("utf-8")).hexdigest()
     except ConfigError as exc:
         events.log(
             "configuration_error",
@@ -288,7 +341,20 @@ def main(argv: list[str] | None = None) -> int:
             seen_job_ids.add(job_id)
             content_hash = hash_job_content(scraped)
             prior = state.get(job_id, {})
-            record = build_state_record(prior, scraped, job_id, content_hash, now)
+            had_prior_evaluation = bool(prior.get("fit_score"))
+            fingerprint = build_evaluation_fingerprint(
+                config,
+                resume_hash,
+                content_hash,
+            )
+            record = build_state_record(
+                prior,
+                scraped,
+                job_id,
+                content_hash,
+                fingerprint,
+                now,
+            )
 
             if not scraped.text:
                 stats.errors += 1
@@ -366,10 +432,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
 
-            cached_analysis = load_cached_analysis(record)
+            cached_analysis = load_cached_analysis(record, fingerprint)
             if (
                 prior
                 and prior.get("content_hash") == content_hash
+                and prior.get("evaluation_fingerprint") == fingerprint
                 and prior.get("fit_score")
                 and cached_analysis
             ):
@@ -402,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
 
-            needs_recalculation = bool(prior and prior.get("fit_score"))
+            needs_recalculation = had_prior_evaluation
             if args.dry_run:
                 if stats.would_evaluate >= config.max_new_evaluations_per_run:
                     stats.deferred += 1
@@ -480,6 +547,8 @@ def main(argv: list[str] | None = None) -> int:
                 company=scraped.company,
                 url=scraped.url,
                 model=config.llm_model,
+                api_mode=config.llm_api_mode,
+                reasoning_effort=config.llm_reasoning_effort,
             )
             try:
                 if client is None:
@@ -488,7 +557,15 @@ def main(argv: list[str] | None = None) -> int:
                 stats.evaluated += 1
                 if needs_recalculation:
                     stats.recalculated += 1
-                analysis_path = save_analysis(job_id, scraped, content_hash, config, now, analysis)
+                analysis_path = save_analysis(
+                    job_id,
+                    scraped,
+                    content_hash,
+                    fingerprint,
+                    config,
+                    now,
+                    analysis,
+                )
                 record.update(
                     {
                         "fit_score": str(analysis["fit_score"]),
@@ -496,6 +573,9 @@ def main(argv: list[str] | None = None) -> int:
                         "last_evaluated_at": now,
                         "analysis_path": analysis_path,
                         "model": config.llm_model,
+                        "api_mode": config.llm_api_mode,
+                        "reasoning_effort": config.llm_reasoning_effort,
+                        "evaluation_fingerprint": fingerprint,
                         "last_evaluation_status": (
                             "recalculated" if needs_recalculation else "evaluated"
                         ),
@@ -653,8 +733,37 @@ def load_config(require_llm: bool = True) -> Config:
         raise ConfigError("JOB_URLS did not contain any URLs")
 
     llm_api_key = required_env("LLM_API_KEY") if require_llm else os.getenv("LLM_API_KEY", "")
-    llm_model = required_env("LLM_MODEL") if require_llm else os.getenv("LLM_MODEL", "dry-run")
+    llm_model = (
+        required_env("LLM_MODEL")
+        if require_llm
+        else os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL).strip() or DEFAULT_LLM_MODEL
+    )
     llm_base_url = os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL).strip()
+    if not llm_base_url:
+        raise ConfigError("LLM_BASE_URL is required")
+
+    default_api_mode = (
+        DEFAULT_LLM_API_MODE
+        if llm_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL.rstrip("/")
+        else "chat_completions"
+    )
+    llm_api_mode = parse_choice(
+        "LLM_API_MODE",
+        os.getenv("LLM_API_MODE", ""),
+        default_api_mode,
+        LLM_API_MODES,
+    )
+    default_reasoning_effort = (
+        DEFAULT_LLM_REASONING_EFFORT
+        if llm_api_mode == "responses"
+        else "default"
+    )
+    llm_reasoning_effort = parse_choice(
+        "LLM_REASONING_EFFORT",
+        os.getenv("LLM_REASONING_EFFORT", ""),
+        default_reasoning_effort,
+        LLM_REASONING_EFFORTS,
+    )
 
     return Config(
         resume_file=resume_file,
@@ -663,6 +772,8 @@ def load_config(require_llm: bool = True) -> Config:
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
         llm_model=llm_model,
+        llm_api_mode=llm_api_mode,
+        llm_reasoning_effort=llm_reasoning_effort,
         scrape_timeout_seconds=parse_positive_int(
             "SCRAPE_TIMEOUT_SECONDS", DEFAULT_SCRAPE_TIMEOUT_SECONDS
         ),
@@ -680,6 +791,19 @@ def load_config(require_llm: bool = True) -> Config:
             DEFAULT_MAX_NEW_EVALUATIONS_PER_RUN,
         ),
     )
+
+
+def parse_choice(
+    name: str,
+    raw_value: str,
+    default: str,
+    allowed: set[str],
+) -> str:
+    value = raw_value.strip().lower() or default
+    if value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigError(f"{name} must be one of: {choices}")
+    return value
 
 
 def required_env(name: str) -> str:
@@ -1347,7 +1471,7 @@ def evaluate_job(
         },
     ]
 
-    content = create_chat_completion(client, config.llm_model, messages)
+    content = create_llm_response(client, config, messages)
     parsed = parse_json_object(content)
     return normalize_analysis(parsed, scraped)
 
@@ -1400,32 +1524,92 @@ def truncate_text(text: str, max_chars: int) -> str:
     )
 
 
-def create_chat_completion(
+def create_llm_response(
     client: OpenAI,
-    model: str,
+    config: Config,
     messages: list[dict[str, str]],
 ) -> str:
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        if "response_format" not in str(exc).lower():
-            raise
+    if config.llm_api_mode == "responses":
+        return create_responses_output(client, config, messages)
+    if config.llm_api_mode == "chat_completions":
+        return create_chat_completion_output(client, config, messages)
+    raise RuntimeError(f"Unsupported LLM API mode: {config.llm_api_mode}")
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.2,
-        )
 
+def create_responses_output(
+    client: OpenAI,
+    config: Config,
+    messages: list[dict[str, str]],
+) -> str:
+    request: dict[str, Any] = {
+        "model": config.llm_model,
+        "instructions": messages[0]["content"],
+        "input": messages[1]["content"],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "job_evaluation",
+                "strict": True,
+                "schema": JOB_EVALUATION_SCHEMA,
+            }
+        },
+        "store": False,
+    }
+    if config.llm_reasoning_effort != "default":
+        request["reasoning"] = {"effort": config.llm_reasoning_effort}
+
+    response = client.responses.create(**request)
+    status = object_value(response, "status")
+    if status == "incomplete":
+        details = object_value(response, "incomplete_details")
+        reason = object_value(details, "reason") or "unknown reason"
+        raise RuntimeError(f"LLM response was incomplete: {reason}")
+    if status and status != "completed":
+        raise RuntimeError(f"LLM response ended with status {status}")
+
+    refusal = response_refusal(response)
+    if refusal:
+        raise RuntimeError(f"LLM refused the job evaluation: {refusal}")
+
+    content = object_value(response, "output_text")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("LLM response was empty")
+    return content
+
+
+def create_chat_completion_output(
+    client: OpenAI,
+    config: Config,
+    messages: list[dict[str, str]],
+) -> str:
+    request: dict[str, Any] = {
+        "model": config.llm_model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+    }
+    if config.llm_reasoning_effort != "default":
+        request["reasoning_effort"] = config.llm_reasoning_effort
+
+    response = client.chat.completions.create(**request)
     content = response.choices[0].message.content
     if not content:
         raise RuntimeError("LLM response was empty")
     return content
+
+
+def object_value(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def response_refusal(response: Any) -> str:
+    for item in object_value(response, "output") or []:
+        for content in object_value(item, "content") or []:
+            refusal = object_value(content, "refusal")
+            if isinstance(refusal, str) and refusal.strip():
+                return refusal.strip()
+    return ""
 
 
 def parse_json_object(content: str) -> dict[str, Any]:
@@ -1512,6 +1696,24 @@ def hash_job_content(scraped: ScrapedJob) -> str:
         ]
     )
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def build_evaluation_fingerprint(
+    config: Config,
+    resume_hash: str,
+    content_hash: str,
+) -> str:
+    identity = {
+        "api_mode": config.llm_api_mode,
+        "base_url": config.llm_base_url.rstrip("/"),
+        "content_hash": content_hash,
+        "model": config.llm_model,
+        "prompt_version": EVALUATION_PROMPT_VERSION,
+        "reasoning_effort": config.llm_reasoning_effort,
+        "resume_hash": resume_hash,
+    }
+    serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def safe_filename(value: str) -> str:
@@ -1645,6 +1847,7 @@ def build_state_record(
     scraped: ScrapedJob,
     job_id: str,
     content_hash: str,
+    evaluation_fingerprint: str,
     now: str,
 ) -> dict[str, str]:
     record = normalize_state_row(prior)
@@ -1669,12 +1872,22 @@ def build_state_record(
         record["first_seen_at"] = now
     if scraped.can_apply:
         record["closed_at"] = ""
-    if prior.get("content_hash") and prior.get("content_hash") != content_hash:
+    evaluation_changed = bool(
+        prior
+        and (
+            prior.get("content_hash") != content_hash
+            or prior.get("evaluation_fingerprint") != evaluation_fingerprint
+        )
+    )
+    if evaluation_changed:
         record["fit_score"] = ""
         record["should_apply"] = ""
         record["last_evaluated_at"] = ""
         record["analysis_path"] = ""
         record["model"] = ""
+        record["api_mode"] = ""
+        record["reasoning_effort"] = ""
+        record["evaluation_fingerprint"] = ""
     return record
 
 
@@ -1686,7 +1899,10 @@ def relative_analysis_path(path: Path) -> str:
     return str(path.relative_to(STATE_DIR))
 
 
-def load_cached_analysis(record: dict[str, str]) -> dict[str, Any] | None:
+def load_cached_analysis(
+    record: dict[str, str],
+    evaluation_fingerprint: str,
+) -> dict[str, Any] | None:
     analysis_path = record.get("analysis_path", "")
     if not analysis_path:
         return None
@@ -1702,6 +1918,8 @@ def load_cached_analysis(record: dict[str, str]) -> dict[str, Any] | None:
 
     if payload.get("content_hash") != record.get("content_hash"):
         return None
+    if payload.get("evaluation_fingerprint") != evaluation_fingerprint:
+        return None
     analysis = payload.get("analysis")
     return analysis if isinstance(analysis, dict) else None
 
@@ -1710,6 +1928,7 @@ def save_analysis(
     job_id: str,
     scraped: ScrapedJob,
     content_hash: str,
+    evaluation_fingerprint: str,
     config: Config,
     evaluated_at: str,
     analysis: dict[str, Any],
@@ -1723,6 +1942,10 @@ def save_analysis(
         "company": scraped.company,
         "content_hash": content_hash,
         "model": config.llm_model,
+        "api_mode": config.llm_api_mode,
+        "reasoning_effort": config.llm_reasoning_effort,
+        "evaluation_fingerprint": evaluation_fingerprint,
+        "prompt_version": EVALUATION_PROMPT_VERSION,
         "evaluated_at": evaluated_at,
         "analysis": analysis,
     }

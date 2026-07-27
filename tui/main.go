@@ -37,12 +37,16 @@ const (
 var screenNames = []string{"Dashboard", "Jobs", "Archived", "Run", "Settings"}
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 var jobReferencePattern = regexp.MustCompile(`(?i)JR-\d+`)
+var llmAPIModes = []string{"responses", "chat_completions"}
+var llmReasoningEfforts = []string{"default", "none", "low", "medium", "high", "xhigh", "max"}
 
 const (
 	scoringFreshWindow             = 24 * time.Hour
 	scoringStaleWindow             = 72 * time.Hour
 	defaultLLMBaseURL              = "https://api.openai.com/v1"
-	defaultLLMModel                = "gpt-5.4"
+	defaultLLMModel                = "gpt-5.6-terra"
+	defaultLLMAPIMode              = "responses"
+	defaultLLMReasoningEffort      = "medium"
 	defaultScrapeTimeoutSeconds    = "20"
 	defaultLLMTimeoutSeconds       = "60"
 	defaultMaxJobsPerSource        = "100"
@@ -111,6 +115,8 @@ type envSummary struct {
 	resumeFile              string
 	model                   string
 	baseURL                 string
+	apiMode                 string
+	reasoningEffort         string
 	jobURLCount             int
 	scrapeTimeoutSeconds    string
 	llmTimeoutSeconds       string
@@ -126,6 +132,7 @@ type settingsField struct {
 	value      string
 	savedValue string
 	secret     bool
+	options    []string
 }
 
 type settingsForm struct {
@@ -139,6 +146,8 @@ type settingsForm struct {
 	sourceExpanded bool
 	sourceSelected int
 	sourceInput    string
+	optionExpanded bool
+	optionSelected int
 	resumeBrowsing bool
 	resumeFiles    []string
 	resumeSelected int
@@ -533,6 +542,9 @@ func updateSettingsNavigation(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
 	if m.settings.sourceExpanded {
 		return updateSourceNavigation(m, key)
 	}
+	if m.settings.optionExpanded {
+		return updateSettingOptionNavigation(m, key)
+	}
 
 	switch key.String() {
 	case "enter", "e":
@@ -545,6 +557,19 @@ func updateSettingsNavigation(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
 			m.settings.sourceSelected = 0
 			m.settings.err = ""
 			m.status = "Job sources expanded"
+			return m, nil, true
+		}
+		if len(field.options) > 0 {
+			m.settings.optionExpanded = true
+			m.settings.optionSelected = 0
+			for i, option := range field.options {
+				if option == field.value {
+					m.settings.optionSelected = i
+					break
+				}
+			}
+			m.settings.err = ""
+			m.status = "Choose " + field.label
 			return m, nil, true
 		}
 		m.settings.editing = true
@@ -572,6 +597,37 @@ func updateSettingsNavigation(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 	return m, nil, false
+}
+
+func updateSettingOptionNavigation(m model, key tea.KeyMsg) (model, tea.Cmd, bool) {
+	field := &m.settings.fields[m.settings.selected]
+	if len(field.options) == 0 {
+		m.settings.optionExpanded = false
+		return m, nil, true
+	}
+
+	maxSelection := len(field.options) - 1
+	switch key.String() {
+	case "enter":
+		field.value = field.options[m.settings.optionSelected]
+		m.settings.optionExpanded = false
+		m.settings.dirty = m.settings.hasChanges()
+		m.status = "Settings changed; press s to save"
+	case "up", "k", "left", "h":
+		m.settings.optionSelected = max(0, m.settings.optionSelected-1)
+	case "down", "j", "right", "l":
+		m.settings.optionSelected = min(maxSelection, m.settings.optionSelected+1)
+	case "home":
+		m.settings.optionSelected = 0
+	case "end":
+		m.settings.optionSelected = maxSelection
+	case "esc":
+		m.settings.optionExpanded = false
+		m.status = "Selection cancelled"
+	default:
+		return m, nil, false
+	}
+	return m, nil, true
 }
 
 func updateSettingsKey(m model, key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1133,6 +1189,8 @@ func (m model) footerView() string {
 				help = "enter finish  esc cancel edit  ctrl+u clear  ctrl+s save"
 			case m.settings.sourceExpanded:
 				help = "enter edit  a add  delete remove  arrows move  s save  esc collapse"
+			case m.settings.optionExpanded:
+				help = "enter select  arrows move  esc cancel  q quit"
 			case m.settings.editing:
 				help = "enter finish  esc cancel edit  ctrl+u clear  ctrl+s save"
 			default:
@@ -1161,6 +1219,8 @@ func (m model) dashboardView() string {
 		keyValue("Resume", valueOrDash(m.env.resumeFile)),
 		keyValue("Model", valueOrDash(m.env.model)),
 		keyValue("Base URL", valueOrDash(m.env.baseURL)),
+		keyValue("API mode", valueOrDash(m.env.apiMode)),
+		keyValue("Reasoning effort", valueOrDash(m.env.reasoningEffort)),
 		keyValue("API key configured", boolText(m.env.hasAPIKey)),
 		keyValue("Job URL sources", strconv.Itoa(m.env.jobURLCount)),
 		keyValue("Scrape timeout", secondsText(m.env.scrapeTimeoutSeconds)),
@@ -1221,11 +1281,21 @@ func (m model) settingsView() string {
 	for i := 0; i < fieldCount; i++ {
 		field := m.settings.fields[i]
 		editing := i == m.settings.selected && m.settings.editing && !m.settings.sourceExpanded
-		selected := i == m.settings.selected && !m.settings.sourceExpanded
+		selected := i == m.settings.selected && !m.settings.sourceExpanded && !m.settings.optionExpanded
 		if selected {
 			selectedLine = len(body)
 		}
 		body = append(body, renderSettingRow(field, selected, editing, m.settings.cursor, labelWidth, valueWidth, m.width))
+
+		if i == m.settings.selected && m.settings.optionExpanded {
+			for optionIndex, option := range field.options {
+				optionSelected := optionIndex == m.settings.optionSelected
+				if optionSelected {
+					selectedLine = len(body)
+				}
+				body = append(body, renderSettingOptionRow(option, optionSelected, m.width))
+			}
+		}
 
 		if field.key != "JOB_URLS" || !m.settings.sourceExpanded {
 			continue
@@ -1275,6 +1345,8 @@ func (m model) settingsView() string {
 		hint := settingsFieldHint(m.settings.fields[m.settings.selected].key)
 		if m.settings.sourceExpanded {
 			hint = "The empty first row adds a source. Enter edits; Delete removes the selected URL."
+		} else if m.settings.optionExpanded {
+			hint = "Choose a value with the arrow keys and press Enter."
 		}
 		lines = append(lines, "", mutedStyle.Render(hint))
 	}
@@ -1313,6 +1385,18 @@ func renderSourceRow(label string, storedValue string, selected bool, editing bo
 	}
 	line := fmt.Sprintf("  %s %-3s %s", marker, label, value)
 	if selected && !editing {
+		return renderSelectedSettingsLine(line, width)
+	}
+	return line
+}
+
+func renderSettingOptionRow(option string, selected bool, width int) string {
+	marker := " "
+	if selected {
+		marker = ">"
+	}
+	line := "  " + marker + " " + option
+	if selected {
 		return renderSelectedSettingsLine(line, width)
 	}
 	return line
@@ -2087,6 +2171,18 @@ func loadEnvSummary(appDir string) (envSummary, error) {
 		}
 		values[key] = value
 	}
+	if strings.TrimSpace(fileValues["LLM_API_MODE"]) == "" {
+		if strings.TrimRight(values["LLM_BASE_URL"], "/") != strings.TrimRight(defaultLLMBaseURL, "/") {
+			values["LLM_API_MODE"] = "chat_completions"
+		}
+	}
+	if strings.TrimSpace(fileValues["LLM_REASONING_EFFORT"]) == "" {
+		if values["LLM_API_MODE"] == "responses" {
+			values["LLM_REASONING_EFFORT"] = defaultLLMReasoningEffort
+		} else {
+			values["LLM_REASONING_EFFORT"] = "default"
+		}
+	}
 
 	return envSummary{
 		exists:                  exists,
@@ -2094,6 +2190,8 @@ func loadEnvSummary(appDir string) (envSummary, error) {
 		resumeFile:              values["RESUME_FILE"],
 		model:                   values["LLM_MODEL"],
 		baseURL:                 values["LLM_BASE_URL"],
+		apiMode:                 values["LLM_API_MODE"],
+		reasoningEffort:         values["LLM_REASONING_EFFORT"],
 		jobURLCount:             countJobURLs(values["JOB_URLS"]),
 		scrapeTimeoutSeconds:    values["SCRAPE_TIMEOUT_SECONDS"],
 		llmTimeoutSeconds:       values["LLM_TIMEOUT_SECONDS"],
@@ -2186,6 +2284,8 @@ func defaultSettingsValues() map[string]string {
 		"LLM_BASE_URL":                defaultLLMBaseURL,
 		"LLM_API_KEY":                 "",
 		"LLM_MODEL":                   defaultLLMModel,
+		"LLM_API_MODE":                defaultLLMAPIMode,
+		"LLM_REASONING_EFFORT":        defaultLLMReasoningEffort,
 		"SCRAPE_TIMEOUT_SECONDS":      defaultScrapeTimeoutSeconds,
 		"LLM_TIMEOUT_SECONDS":         defaultLLMTimeoutSeconds,
 		"MAX_JOBS_PER_SOURCE":         defaultMaxJobsPerSource,
@@ -2207,6 +2307,8 @@ func newSettingsForm(env envSummary) settingsForm {
 		{key: "LLM_BASE_URL", label: "LLM base URL", value: values["LLM_BASE_URL"]},
 		{key: "LLM_API_KEY", label: "LLM API key", value: values["LLM_API_KEY"], secret: true},
 		{key: "LLM_MODEL", label: "LLM model", value: values["LLM_MODEL"]},
+		{key: "LLM_API_MODE", label: "LLM API mode", value: values["LLM_API_MODE"], options: llmAPIModes},
+		{key: "LLM_REASONING_EFFORT", label: "Reasoning effort", value: values["LLM_REASONING_EFFORT"], options: llmReasoningEfforts},
 		{key: "SCRAPE_TIMEOUT_SECONDS", label: "Scrape timeout (sec)", value: values["SCRAPE_TIMEOUT_SECONDS"]},
 		{key: "LLM_TIMEOUT_SECONDS", label: "LLM timeout (sec)", value: values["LLM_TIMEOUT_SECONDS"]},
 		{key: "MAX_JOBS_PER_SOURCE", label: "Max jobs per source", value: values["MAX_JOBS_PER_SOURCE"]},
@@ -2226,6 +2328,7 @@ func (form *settingsForm) moveSelection(delta int) {
 	form.selected = (form.selected + delta + len(form.fields)) % len(form.fields)
 	form.cursor = 0
 	form.err = ""
+	form.optionExpanded = false
 }
 
 func (form *settingsForm) finishEditing() {
@@ -2259,6 +2362,7 @@ func (form *settingsForm) selectKey(key string) {
 			form.cursor = 0
 			form.editing = false
 			form.sourceExpanded = false
+			form.optionExpanded = false
 			form.resumeBrowsing = false
 			return
 		}
@@ -2357,6 +2461,18 @@ func configurationIssues(values map[string]string, requireLLM bool) []configIssu
 			issues = append(issues, configIssue{key: "LLM_MODEL", message: "LLM model is required for a full run"})
 		}
 	}
+	if !containsString(llmAPIModes, strings.TrimSpace(values["LLM_API_MODE"])) {
+		issues = append(issues, configIssue{
+			key:     "LLM_API_MODE",
+			message: "LLM API mode must be responses or chat_completions",
+		})
+	}
+	if !containsString(llmReasoningEfforts, strings.TrimSpace(values["LLM_REASONING_EFFORT"])) {
+		issues = append(issues, configIssue{
+			key:     "LLM_REASONING_EFFORT",
+			message: "Reasoning effort is not supported",
+		})
+	}
 
 	positiveKeys := []string{
 		"SCRAPE_TIMEOUT_SECONDS",
@@ -2379,6 +2495,15 @@ func configurationIssues(values map[string]string, requireLLM bool) []configIssu
 	}
 
 	return issues
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func settingsLabel(key string) string {
@@ -2439,6 +2564,8 @@ func updateDotEnvContent(existing string, values map[string]string) string {
 		"LLM_BASE_URL",
 		"LLM_API_KEY",
 		"LLM_MODEL",
+		"LLM_API_MODE",
+		"LLM_REASONING_EFFORT",
 		"SCRAPE_TIMEOUT_SECONDS",
 		"LLM_TIMEOUT_SECONDS",
 		"MAX_JOBS_PER_SOURCE",
@@ -2949,6 +3076,10 @@ func settingsFieldHint(key string) string {
 		return "Required for full runs; masked on screen and stored only in .env."
 	case "LLM_MODEL":
 		return "Model name sent to the configured LLM API."
+	case "LLM_API_MODE":
+		return "Responses uses reasoning.effort; Chat Completions supports compatible providers."
+	case "LLM_REASONING_EFFORT":
+		return "Default omits the parameter; other values set the model reasoning effort."
 	case "MAX_NEW_EVALUATIONS_PER_RUN":
 		return "May be zero; all other numeric settings must be greater than zero."
 	default:

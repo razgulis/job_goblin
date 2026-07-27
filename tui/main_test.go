@@ -65,6 +65,9 @@ func TestLoadEnvSummaryUsesFirstRunDefaultsWithoutEnvFile(t *testing.T) {
 	}
 
 	want := map[string]string{
+		"LLM_MODEL":                   "gpt-5.6-terra",
+		"LLM_API_MODE":                "responses",
+		"LLM_REASONING_EFFORT":        "medium",
 		"SCRAPE_TIMEOUT_SECONDS":      "20",
 		"LLM_TIMEOUT_SECONDS":         "60",
 		"MAX_JOBS_PER_SOURCE":         "100",
@@ -119,6 +122,30 @@ LLM_API_KEY=old-key
 	}
 	if got := roundTrip["LLM_API_KEY"]; got != "new-key" {
 		t.Errorf("LLM_API_KEY = %q, want new-key", got)
+	}
+	if got := roundTrip["LLM_API_MODE"]; got != "responses" {
+		t.Errorf("LLM_API_MODE = %q, want responses", got)
+	}
+	if got := roundTrip["LLM_REASONING_EFFORT"]; got != "medium" {
+		t.Errorf("LLM_REASONING_EFFORT = %q, want medium", got)
+	}
+}
+
+func TestLoadEnvSummaryUsesCompatibilityDefaultsForCustomBaseURL(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".env"), `LLM_BASE_URL=https://llm.example.com/v1
+LLM_MODEL=custom-model
+`)
+
+	summary, err := loadEnvSummary(dir)
+	if err != nil {
+		t.Fatalf("loadEnvSummary: %v", err)
+	}
+	if got := summary.values["LLM_API_MODE"]; got != "chat_completions" {
+		t.Fatalf("LLM_API_MODE = %q, want chat_completions", got)
+	}
+	if got := summary.values["LLM_REASONING_EFFORT"]; got != "default" {
+		t.Fatalf("LLM_REASONING_EFFORT = %q, want default", got)
 	}
 }
 
@@ -245,6 +272,61 @@ func TestSelectedSettingRowHighlightsLabelValueAndFullWidth(t *testing.T) {
 	}
 	if got := ansi.StringWidth(row); got != 100 {
 		t.Fatalf("selected row width = %d, want 100", got)
+	}
+}
+
+func TestReasoningEffortExpandsInlineAndSelectsAValue(t *testing.T) {
+	values := defaultSettingsValues()
+	env := envSummary{exists: true, values: values}
+	form := newSettingsForm(env)
+	form.selectKey("LLM_REASONING_EFFORT")
+	m := model{
+		appDir:   "/tmp/job-goblin",
+		width:    100,
+		height:   32,
+		screen:   screenSettings,
+		env:      env,
+		settings: form,
+	}
+
+	expanded, _, handled := updateSettingsNavigation(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled || !expanded.settings.optionExpanded {
+		t.Fatal("Enter did not expand the reasoning effort selector")
+	}
+	view := ansi.Strip(expanded.settingsView())
+	for _, expected := range []string{"default", "low", "medium", "xhigh", "Max evaluations/run"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("expanded selector missing %q:\n%s", expected, view)
+		}
+	}
+
+	expanded, _, _ = updateSettingOptionNavigation(expanded, tea.KeyMsg{Type: tea.KeyUp})
+	selected, _, _ := updateSettingOptionNavigation(expanded, tea.KeyMsg{Type: tea.KeyEnter})
+	field := selected.settings.fields[selected.settings.selected]
+	if field.value != "low" {
+		t.Fatalf("reasoning effort = %q, want low", field.value)
+	}
+	if selected.settings.optionExpanded {
+		t.Fatal("selector remained expanded after choosing a value")
+	}
+	if !selected.settings.dirty {
+		t.Fatal("choosing a reasoning effort did not mark settings dirty")
+	}
+}
+
+func TestConfigurationRejectsUnknownLLMOptions(t *testing.T) {
+	values := defaultSettingsValues()
+	values["RESUME_FILE"] = "candidate.md"
+	values["JOB_URLS"] = "https://jobs.example.com/search"
+	values["LLM_API_MODE"] = "automatic"
+	values["LLM_REASONING_EFFORT"] = "extreme"
+
+	issues := configurationIssues(values, false)
+	if len(issues) < 2 {
+		t.Fatalf("configurationIssues returned %#v, want API mode and effort errors", issues)
+	}
+	if issues[0].key != "LLM_API_MODE" || issues[1].key != "LLM_REASONING_EFFORT" {
+		t.Fatalf("configuration issue order = %#v", issues)
 	}
 }
 

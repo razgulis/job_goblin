@@ -94,7 +94,8 @@ required settings is redirected there instead of starting the analyzer.
 
 On `Job sources`, `enter` expands a one-URL-per-row editor in place with an empty
 add row at the top. On `Resume file`, `enter` browses the Markdown files under
-`resume/`.
+`resume/`. The API mode and reasoning effort fields open an in-place list of
+supported values.
 
 To build a reusable local binary:
 
@@ -120,8 +121,18 @@ The LLM settings use an OpenAI-compatible API:
 ```env
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=replace-me
-LLM_MODEL=gpt-5.4
+LLM_MODEL=gpt-5.6-terra
+LLM_API_MODE=responses
+LLM_REASONING_EFFORT=medium
 ```
+
+`responses` sends the reasoning setting as `reasoning.effort`, uses strict
+structured output, and disables Responses application-state storage. Use
+`chat_completions` for an OpenAI-compatible provider that does not implement
+`/responses`; that mode sends `reasoning_effort`. Set the effort to `default`
+to omit the reasoning parameter for a provider or model that does not support
+it. Changing the model, provider, API mode, reasoning effort, resume, or
+evaluation prompt invalidates cached job scores.
 
 Workday search URLs are expanded through Workday's public jobs API. A URL like this is treated as a search source:
 
